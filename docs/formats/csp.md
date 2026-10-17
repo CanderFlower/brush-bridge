@@ -112,7 +112,7 @@ The header is made of u32 words. Its size (word 0) depends on the CSP version:
 | 3–6 | minimum % for pressure, tilt, velocity, random |
 | 7 | 0 |
 | 8 | byte size of the pressure curve block after the header (0 = no curve) |
-| 9 | byte size of a second curve block |
+| 9 | byte size of the tilt curve block after the pressure block (0 = no curve) |
 | 10 | (`≥0x2c`) 100 or 500, unknown |
 | 11 | (`0x30`) 0 |
 
@@ -120,6 +120,9 @@ The header is made of u32 words. Its size (word 0) depends on the CSP version:
 * **Neutral model:** influence = `1 - minimum/100` for each enabled input.
 * **Writing:** brush-bridge writes the `0x2c` layout with a linear 2-point curve, or the source
   pressure curve when it has one.
+* **Tilt needs its curve block.** Factory data always has a tilt block when `0x20` is enabled.
+  A blob with tilt enabled and word 9 = 0 makes CSP 5.1.2 crash while importing the `.sut`.
+  brush-bridge always writes both blocks when pressure or tilt is enabled.
 * **Colour change effectors** (`Brush{Hue,Saturation,Value,SubColor}ChangeEffector`): the column
   value is a signed amount (hue ±180, saturation/value ±100) and CSP applies
   `amount × input × r`, where `r` is uniformly random in `[random_min/100, 1]`. Factory brushes use
@@ -257,7 +260,7 @@ textures). The builder reproduces CSP's own `Offscreen` attribute, empty and pix
 | `BrushUsePatternImage`, `BrushPatternImageArray` | `tips` | full resolution for generated materials, thumbnails otherwise |
 | `BrushPatternOrderType` | `tip_order` | 3 = random **(inferred)** |
 | `BrushPatternReverseHorizontal/Vertical` | `flip_x/flip_y` | |
-| `BrushUseSpray`, `BrushSpraySize(+Unit, SyncBrushSize)`, `BrushSprayDensity(+Effector)` | `scatter`, `scatter_both_axes`, `count`, `count_jitter` | scatter = spray diameter ÷ brush size |
+| `BrushUseSpray`, `BrushSpraySize(+Unit, SyncBrushSize)`, `BrushSprayDensity(+Effector)` | `size_px`, `spacing`, `scatter`, `scatter_both_axes`, `count`, `count_jitter` | see "Spray semantics" below |
 | `BrushUseIn/Out`, `BrushIn/OutLength(+Unit)`, `BrushInOutType` | `taper_start/end` | length px ÷ 100 (type 1 = %) |
 | `TextureImage`, `TextureCompositeMode`, `TextureScale2`, `TextureDensity(+Effector)`, `TextureReverseDensity`, `TextureBrightness`, `TextureContrast`, `TextureForPlot` | `texture` | composite mode 0 = multiply, 1 = subtract **(inferred)** |
 | `UseDualBrush`, `Dual*` | `dual` | |
@@ -281,6 +284,22 @@ textures). The builder reproduces CSP's own `Offscreen` attribute, empty and pix
 | 27 | transparent (every eraser uses it) |
 
 Factory brushes use only 0, 2, 27 and 31. Value 31 is probably "compare density" and is read as normal.
+
+### Spray semantics
+
+With `BrushUseSpray=1`, `BrushSize` is the **spray area** and `BrushSpraySize` is the **particle
+(tip) size**: px, or % of `BrushSize` when `BrushSpraySizeSyncBrushSize=1`. `BrushSprayDensity` is
+the number of particles per dab and `BrushInterval` stays a % of `BrushSize` (the area). Factory
+examples: 噴霧 100 px / 12.8 px, 濕潤水彩 30 px / 120 %.
+
+brush-bridge maps this with `spray_layout()`:
+
+* scatter ≥ 0.1: area = 2 × scatter × tip size, particle = 100 / (2 × scatter) % (synced),
+  interval = spacing × tip size ÷ area.
+* scatter < 0.1: spray is turned off. Several tips per dab without positional scatter (e.g.
+  Procreate "count 2, jitter 0") are approximated by dividing the interval by the count.
+
+Reading reverses this: tip size = particle size, scatter = area ÷ (2 × particle).
 
 **Lossless round trip:** `Brush.source.native["csp"]` keeps the following:
 

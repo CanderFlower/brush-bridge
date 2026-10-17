@@ -209,11 +209,15 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
     b.flip_y = bool(v.get("BrushPatternReverseVertical"))
     b.tip_order = "random" if int(v.get("BrushPatternOrderType") or 0) == ORDER_RANDOM else "sequential"
 
-    # Spray
+    # Spray: BrushSize becomes the spray *area* and BrushSpraySize the *particle* size
     if int(v.get("BrushUseSpray") or 0):
         sp = _num(v.get("BrushSpraySize"))
-        spray_px = b.size_px * sp / 100 if int(v.get("BrushSpraySizeSyncBrushSize") or 0) else to_px(sp, v.get("BrushSpraySizeUnit"))
-        b.scatter = max(0.0, spray_px / max(b.size_px, 0.1))
+        area = b.size_px
+        particle = area * sp / 100 if int(v.get("BrushSpraySizeSyncBrushSize") or 0) else to_px(sp, v.get("BrushSpraySizeUnit"))
+        particle = max(0.1, particle or area)
+        b.size_px = particle
+        b.spacing = max(0.01, b.spacing * area / particle)
+        b.scatter = max(0.0, area / (2 * particle))
         b.scatter_both_axes = True
         b.count = max(1, int(_num(v.get("BrushSprayDensity"), 1)))
         b.count_jitter = _dyn(v.get("BrushSprayDensityEffector")).jitter
@@ -309,24 +313,43 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
     return b
 
 
+SPRAY_MIN_SCATTER = 0.1  # below this, positional scatter is invisible and spray mode only hurts
+
+
+def spray_layout(size_px: float, spacing: float, scatter: float, count: int) -> tuple[bool, float, float, float]:
+    """Neutral tip size/spacing/scatter/count -> (use spray, BrushSize, BrushSpraySize %, BrushInterval).
+
+    With spray on, CSP treats BrushSize as the spray *area* (particle centres land inside it) and
+    BrushSpraySize as the particle size; synced to the brush size so pressure still scales both.
+    Without scatter, extra tips per dab are approximated by a proportionally denser interval.
+    """
+    size_px = max(0.1, size_px)
+    if scatter >= SPRAY_MIN_SCATTER:
+        area = 2 * scatter * size_px
+        return True, area, round(100 / (2 * scatter), 2), round(max(0.01, spacing * size_px / area) * 100, 2)
+    return False, size_px, 100.0, round(max(0.01, spacing / max(1, count)) * 100, 2)
+
+
 def brush_columns(b: Brush) -> dict[str, object]:
     """Neutral Brush -> Variant column values (only the columns we understand)."""
     comp = COMPOSITE_ERASER if b.is_eraser else BLEND_TO_COMPOSITE.get(b.blend_mode, 0)
     rot = ROT_BASE | (ROT_DIRECTION if b.angle_follow_stroke else 0) | (ROT_RANDOM if b.angle_jitter > 0 else 0)
-    spray = b.scatter > 0 or b.count > 1
+    spray, area, particle_pct, interval = spray_layout(b.size_px, b.spacing, b.scatter, b.count)
+    if not spray and b.count > 1:
+        b.warn(f"每次落笔 {b.count} 个笔尖且没有位置散布，Clip Studio Paint 中已改为用更密的间隔近似。")
     c: dict[str, object] = {
         "Opacity": int(round(_clamp(b.opacity) * 100)),
         "AntiAlias": 1 if b.antialias else 0,
         "CompositeMode": comp,
         "Stickness": int(round(_clamp(b.stabilization) * 100)),
-        "BrushSize": round(float(b.size_px), 2),
+        "BrushSize": round(float(area), 2),
         "BrushSizeUnit": 0,
         "BrushSizeEffector": _enc(b.size_dynamic),
         "BrushOpacityEffector": _enc(b.opacity_dynamic),
         "BrushFlow": int(round(_clamp(b.flow) * 100)),
         "BrushFlowEffector": _enc(b.flow_dynamic),
         "BrushHardness": int(round(_clamp(b.hardness) * 100)),
-        "BrushInterval": round(max(0.01, b.spacing) * 100, 2),
+        "BrushInterval": interval,
         "BrushAutoIntervalType": 0,
         "BrushThickness": max(1, int(round(_clamp(b.roundness) * 100))),
         "BrushThicknessEffector": encode_effector(jitter=b.roundness_jitter),
@@ -338,9 +361,9 @@ def brush_columns(b: Brush) -> dict[str, object]:
         "BrushPatternReverseVertical": int(b.flip_y),
         "BrushPatternOrderType": ORDER_RANDOM if b.tip_order == "random" else 0,
         "BrushUseSpray": int(spray),
-        "BrushSpraySize": round(max(b.scatter, 0.01) * b.size_px, 2) if spray else 2.0,
+        "BrushSpraySize": particle_pct,
         "BrushSpraySizeUnit": 0,
-        "BrushSpraySizeSyncBrushSize": 0,
+        "BrushSpraySizeSyncBrushSize": 1,
         "BrushSprayDensity": max(1, int(b.count)),
         "BrushSprayDensityEffector": encode_effector(jitter=b.count_jitter),
         # with spray on, CSP rotates particles using the *InSpray fields
@@ -408,13 +431,12 @@ def brush_columns(b: Brush) -> dict[str, object]:
                   "TextureDensityEffector": _enc(t.depth_dynamic)})
     d = b.dual
     if d is not None:
-        dspray = d.scatter > 0 or d.count > 1
+        dspray, darea, dpct, dint = spray_layout(max(1.0, d.size_px), d.spacing, d.scatter, d.count)
         c.update({"DualBrushCompositeMode": BLEND_TO_COMPOSITE.get(d.mode, 2), "SyncDualBrushSize": 0,
-                  "DualSize": round(max(1.0, d.size_px), 2), "DualSizeUnit": 0,
-                  "DualInterval": round(max(0.01, d.spacing) * 100, 2), "DualAutoIntervalType": 0,
+                  "DualSize": round(max(1.0, darea), 2), "DualSizeUnit": 0,
+                  "DualInterval": dint, "DualAutoIntervalType": 0,
                   "DualUseSpray": int(dspray), "DualSprayDensity": max(1, int(d.count)),
-                  "DualSpraySize": round(max(d.scatter, 0.01) * d.size_px, 2) if dspray else 2.0,
-                  "DualSpraySizeUnit": 0, "DualSpraySizeSyncBrushSize": 0})
+                  "DualSpraySize": dpct, "DualSpraySizeUnit": 0, "DualSpraySizeSyncBrushSize": 1})
     return c
 
 

@@ -79,6 +79,23 @@ def test_effector_custom_curve_and_random_min():
     assert e.pressure_curve == [pytest.approx(p, abs=1e-4) for p in curve]
 
 
+def test_effector_tilt_always_has_curve_block():
+    # CSP crashes on import when an enabled tilt input has no curve block (word 9 = 0)
+    import struct
+
+    for kw in ({"tilt": 0.2}, {"tilt": 0.5, "jitter": 1.0}, {"pressure": 1.0, "tilt": 1.0}):
+        blob = encode_effector(**kw)
+        w = struct.unpack_from(">11i", blob, 0)
+        if w[2] & 0x10:
+            assert w[8] == 44
+        assert w[9] == 44 and len(blob) == 0x2C + w[8] + w[9]
+        e = decode_effector(blob)
+        assert e.tilt_curve == [(0.0, 0.0), (1.0, 1.0)]
+    curve = [(0.0, 1.0), (1.0, 0.2)]
+    e = decode_effector(encode_effector(pressure=1.0, tilt=1.0, tilt_curve=curve))
+    assert e.pressure_curve == [(0.0, 0.0), (1.0, 1.0)] and e.tilt_curve == [pytest.approx(p) for p in curve]
+
+
 def test_color_channel_roundtrip():
     from brush_bridge.formats.csp import color_channel, read_color_channel
 
@@ -131,6 +148,24 @@ def test_edge_and_color_shift_columns(tmp_path):
     assert r.color.saturation_pressure == pytest.approx(-0.13, abs=0.01)
     assert r.color.saturation_jitter == pytest.approx(0.13, abs=0.01)
     assert r.color.brightness_pressure < 0 and not r.color.pressure_curves
+
+
+def test_spray_area_and_particle_semantics(tmp_path):
+    # Procreate-style "2 tips per dab, no positional jitter" must not become a sparse spray
+    b = Brush(name="双印", size_px=43.4, spacing=0.07, count=2, angle_jitter=1.0)
+    v = _variant(CspCodec().write([b], tmp_path / "count.sut")[0])
+    assert v["BrushUseSpray"] == 0 and v["BrushSize"] == pytest.approx(43.4)
+    assert v["BrushInterval"] == pytest.approx(3.5)
+
+    # With scatter, BrushSize is the spray area and the particle size is synced to it
+    b = Brush(name="散布", size_px=20, spacing=0.1, scatter=1.0, count=4)
+    out = CspCodec().write([b], tmp_path / "spray.sut")[0]
+    v = _variant(out)
+    assert v["BrushUseSpray"] == 1 and v["BrushSize"] == pytest.approx(40)
+    assert v["BrushSpraySizeSyncBrushSize"] == 1 and v["BrushSpraySize"] == pytest.approx(50)
+    assert v["BrushSprayDensity"] == 4 and v["BrushInterval"] == pytest.approx(5)
+    r = CspCodec().read(out)[0]
+    assert r.size_px == pytest.approx(20) and r.scatter == pytest.approx(1.0) and r.spacing == pytest.approx(0.1)
 
 
 def test_material_ref_roundtrip():

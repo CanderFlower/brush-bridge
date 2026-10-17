@@ -23,9 +23,13 @@ from PIL import Image
 #   [3] pressure minimum %   [4] tilt minimum %   [5] velocity minimum %   [6] random minimum %
 #   [7] unknown (0)
 #   [8] byte size of the pressure curve block that follows the header (0 = none)
-#   [9] byte size of a second curve block (0 = none)
-#   [10] (header >= 0x2c) unknown, 100 or 500     [11] (header >= 0x30) unknown, 0
+#   [9] byte size of the tilt curve block that follows the pressure block (0 = none)
+#   [10] (header >= 0x2c) tilt maximum % (100; size effectors use 150..500)
+#   [11] (header >= 0x30) unknown, 0
 # Curve block: u32 0x0c, u32 point count, u32 0x10 (bytes per point), then (x, y) float64 pairs.
+# CSP dereferences the curve of every enabled curve input: an effector with pressure or tilt
+# enabled but no matching curve block crashes CSP (5.x) as soon as the sub tool is imported.
+# The tilt input is 0 with the pen lying flat and 1 with it upright.
 EFF_PRESSURE, EFF_TILT, EFF_VELOCITY, EFF_RANDOM = 0x10, 0x20, 0x40, 0x80
 
 
@@ -37,6 +41,7 @@ class Effector:
     velocity_min: int = 0
     random_min: int = 0
     pressure_curve: list[tuple[float, float]] = field(default_factory=list)
+    tilt_curve: list[tuple[float, float]] = field(default_factory=list)
 
     def influence(self, bit: int) -> float:
         """Neutral-model influence (0..1) of one input: 1 - minimum%."""
@@ -71,16 +76,28 @@ def decode_effector(blob) -> Optional[Effector]:
     e = Effector(enabled=w[2], pressure_min=w[3], tilt_min=w[4], velocity_min=w[5], random_min=w[6])
     if w[8] > 0:
         e.pressure_curve = _curve(blob, hdr, w[8])
+    if w[9] > 0:
+        e.tilt_curve = _curve(blob, hdr + max(w[8], 0), w[9])
     return e
+
+
+def _curve_block(points: Optional[list[tuple[float, float]]]) -> bytes:
+    pts = sorted((max(0.0, min(1.0, float(x))), max(0.0, min(1.0, float(y)))) for x, y in (points or []))
+    if len(pts) < 2:
+        pts = [(0.0, 0.0), (1.0, 1.0)]
+    return struct.pack(">III", 0x0C, len(pts), 0x10) + b"".join(struct.pack(">dd", x, y) for x, y in pts)
 
 
 def encode_effector(pressure: float = 0.0, tilt: float = 0.0, velocity: float = 0.0,
                     jitter: float = 0.0, *, pressure_curve: Optional[list[tuple[float, float]]] = None,
+                    tilt_curve: Optional[list[tuple[float, float]]] = None,
                     random_min: Optional[int] = None) -> bytes:
     """Build a 0x2c-header effector (the layout CSP 1.x .. 5.x all read).
 
     ``random_min`` overrides the random input's minimum in percent (-100..100; CSP's colour
-    jitter uses -100, i.e. a two-sided range). ``pressure_curve`` defaults to a straight line.
+    jitter uses -100, i.e. a two-sided range). ``pressure_curve`` and ``tilt_curve`` default to a
+    straight line; a curve block is always written for every enabled curve input (CSP crashes
+    without it).
     """
     enabled = 0
     mins = []
@@ -90,15 +107,10 @@ def encode_effector(pressure: float = 0.0, tilt: float = 0.0, velocity: float = 
         mins.append(int(round(100 * (1.0 - max(0.0, min(1.0, val))))) if val > 0 else 0)
     if random_min is not None and enabled & EFF_RANDOM:
         mins[3] = int(max(-100, min(100, round(random_min))))
-    curve = b""
-    if enabled & EFF_PRESSURE:
-        pts = sorted((max(0.0, min(1.0, float(x))), max(0.0, min(1.0, float(y))))
-                     for x, y in (pressure_curve or [])) or [(0.0, 0.0), (1.0, 1.0)]
-        if len(pts) < 2:
-            pts = [(0.0, 0.0), (1.0, 1.0)]
-        curve = struct.pack(">III", 0x0C, len(pts), 0x10) + b"".join(struct.pack(">dd", x, y) for x, y in pts)
-    head = struct.pack(">11i", 0x2C, 0xF0, enabled, *mins, 0, len(curve), 0, 100)
-    return head + curve
+    pblock = _curve_block(pressure_curve) if enabled & EFF_PRESSURE else b""
+    tblock = _curve_block(tilt_curve) if enabled & EFF_TILT else b""
+    head = struct.pack(">11i", 0x2C, 0xF0, enabled, *mins, 0, len(pblock), len(tblock), 100)
+    return head + pblock + tblock
 
 
 # ---------------------------------------------------------------------------------------------
