@@ -1,4 +1,4 @@
-﻿"""Tests for Clip Studio Paint support (.sut codec + CSP adapter).
+"""Tests for Clip Studio Paint support (.sut codec + CSP adapter).
 
 Real-world samples are never committed. Point BRUSH_BRIDGE_SAMPLES at a folder containing
 ``sample.sut`` (any sub tool exported from CSP) and/or ``tool.todb`` (a *copy* of
@@ -299,7 +299,7 @@ def test_direct_install_into_copy(tmp_path, monkeypatch):
     assert reach_after - reach_before == total_after - total_before
 
     after = adapter.list_brushes(inst)
-    new = [r for r in after if r.group.endswith("/brush-bridge")]
+    new = [r for r in after if r.group.endswith(" / brush-bridge")]
     assert [r.name for r in new] == ["合成笔刷", "直装橡皮", installed.name]
     b = new[0].load()
     assert b.size_px == pytest.approx(42) and b.blend_mode == "multiply"
@@ -308,5 +308,5 @@ def test_direct_install_into_copy(tmp_path, monkeypatch):
     # Second install appends to the same group
     res2 = adapter.install(inst, [Brush(name="第二支")], direct=True)
     assert res2.ok
-    names = [r.name for r in adapter.list_brushes(inst) if r.group.endswith("/brush-bridge")]
+    names = [r.name for r in adapter.list_brushes(inst) if r.group.endswith(" / brush-bridge")]
     assert names[-1] == "第二支" and len(names) == 4

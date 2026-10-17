@@ -4,6 +4,7 @@
 * ``BrushFilterProxy`` – name search + group filter without touching any widget.
 * ``BrushDelegate``   – paints thumbnail, name and a big check mark; no per-item widgets.
 * ``BrushGridView``   – QListView (icon mode): click toggles, Shift+click checks a range.
+* ``GroupTree``       – the source app's own folder structure (e.g. PS groups, CSP tool → sub tool group).
 * ``ThumbnailLoader`` – lazy, deduplicated, prioritised thumbnail rendering on a private thread pool.
   PIL → QImage happens in the worker; QPixmap is only created on the GUI thread.
 """
@@ -22,9 +23,11 @@ from PySide6.QtCore import (
     QThreadPool, QTimer, Signal,
 )
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QListView, QStyle, QStyledItemDelegate
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QListView, QStyle, QStyledItemDelegate, QTreeWidget, QTreeWidgetItem,
+)
 
-from ..core.model import BrushRef
+from ..core.model import GROUP_SEP, BrushRef, split_group
 
 log = logging.getLogger(__name__)
 
@@ -388,8 +391,11 @@ class BrushFilterProxy(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, row: int, parent) -> bool:
         m = self.sourceModel()
-        if self._group is not None and m.groups[row] != self._group:
-            return False
+        if self._group is not None:
+            g = m.groups[row]
+            # a group selects itself and every sub group; "" selects only ungrouped brushes
+            if g != self._group and not (self._group and g.startswith(self._group + GROUP_SEP)):
+                return False
         return not self._text or self._text in m.names_lower[row]
 
     def source_rows(self) -> list[int]:
@@ -639,3 +645,90 @@ class BrushGridView(QListView):
             e.accept()
             return
         super().keyPressEvent(e)
+
+
+# ---------------------------------------------------------------------------------------------
+# group tree
+# ---------------------------------------------------------------------------------------------
+ROLE_PATH = Qt.UserRole + 10
+UNGROUPED = "未分组"
+
+
+class GroupTree(QTreeWidget):
+    """Folder tree of the brushes' groups, in the order the source app stores them.
+
+    ``groupChanged`` emits ``None`` for "all", ``""`` for "ungrouped" or a group path; a group
+    includes its sub groups (see ``BrushFilterProxy``).
+    """
+
+    groupChanged = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setObjectName("groups")
+        self.setUniformRowHeights(True)
+        self.setExpandsOnDoubleClick(True)
+        self.currentItemChanged.connect(self._changed)
+
+    @property
+    def has_groups(self) -> bool:
+        return self.topLevelItemCount() > 0 and self.topLevelItem(0).childCount() > 0
+
+    def set_groups(self, groups: Iterable[str]) -> None:
+        groups = list(groups)
+        counts: dict[str, int] = {}
+        order: list[str] = []  # first appearance = the app's own order
+        ungrouped = 0
+        for g in groups:
+            parts = split_group(g)
+            if not parts:
+                ungrouped += 1
+            for i in range(1, len(parts) + 1):
+                p = GROUP_SEP.join(parts[:i])
+                if p not in counts:
+                    counts[p] = 0
+                    order.append(p)
+                counts[p] += 1
+        self.blockSignals(True)
+        self.clear()
+        root = QTreeWidgetItem([f"全部笔刷（{len(groups)}）"])
+        root.setData(0, ROLE_PATH, None)
+        self.addTopLevelItem(root)
+        items: dict[str, QTreeWidgetItem] = {}
+        for p in order:
+            parts = split_group(p)
+            parent = items.get(GROUP_SEP.join(parts[:-1]), root)
+            it = QTreeWidgetItem(parent, [f"{parts[-1]}（{counts[p]}）"])
+            it.setData(0, ROLE_PATH, p)
+            it.setToolTip(0, p)
+            items[p] = it
+        if ungrouped and order:
+            it = QTreeWidgetItem(root, [f"{UNGROUPED}（{ungrouped}）"])
+            it.setData(0, ROLE_PATH, "")
+        root.setExpanded(True)
+        if len(order) <= 40:
+            self.expandAll()
+        self.setCurrentItem(root)
+        self.blockSignals(False)
+
+    def current_group(self) -> Optional[str]:
+        it = self.currentItem()
+        return it.data(0, ROLE_PATH) if it is not None else None
+
+    def select_group(self, path: Optional[str]) -> bool:
+        for it in self._items():
+            if it.data(0, ROLE_PATH) == path:
+                self.setCurrentItem(it)
+                return True
+        return False
+
+    def _items(self):
+        stack = [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
+        while stack:
+            it = stack.pop(0)
+            yield it
+            stack[:0] = [it.child(i) for i in range(it.childCount())]
+
+    def _changed(self, cur, _prev=None):
+        self.groupChanged.emit(cur.data(0, ROLE_PATH) if cur is not None else None)

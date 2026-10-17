@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from PIL import Image
 
-from ..core.model import Brush, BrushSource, ColorDynamics, Dynamic, DualTip, Texture, WetMix
+from ..core.model import Brush, BrushSource, ColorDynamics, Dynamic, DualTip, Texture, WetMix, join_group
 from ..core.plugin import FileInfo, FormatCodec, Fix, register_codec
 from ..core.system import safe_filename, unique_path
 from . import csp_schema as S
@@ -496,7 +496,7 @@ class CspCodec(FormatCodec):
         out = []
         for i, (n, v) in enumerate(nodes):
             b = variant_to_brush(v, n.row, resolve)
-            b.group = "/".join(p for p in n.path if p)
+            b.group = join_group(*n.path)
             b.source = BrushSource(app="csp", format=self.id, version=str(mgr.get("Version") or ""), path=str(path),
                                    index=i)
             b.source.native = {"csp": {

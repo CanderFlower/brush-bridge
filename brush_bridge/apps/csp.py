@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from ..core.model import Brush, BrushRef, BrushSource
+from ..core.model import Brush, BrushRef, BrushSource, join_group
 from ..core.plugin import AppAdapter, AppInstall, InstallResult, register_app
 from ..core.system import IS_WINDOWS, backup, documents_dir, export_dir, file_version, safe_filename, unique_path
 from ..formats import csp_schema as S
@@ -80,7 +80,7 @@ def _materials_for(variant: dict, root: Path) -> list[dict]:
 def load_installed_brush(snap: dict, node: S.TreeNode, root: Path, todb: Path = Path()) -> Brush:
     v = snap["variants"][node.row["NodeVariantID"]]
     b = variant_to_brush(v, node.row, store_resolver(root))
-    b.group = "/".join(p for p in node.path if p)
+    b.group = join_group(*node.path)
     mgr = snap["manager"]
     b.source = BrushSource(app="csp", format="csp", version=str(mgr.get("Version") or ""), path=str(todb),
                            index=node.row.get("_PW_ID", -1))
@@ -142,7 +142,7 @@ class CspAdapter(AppAdapter):
             if tips:
                 detail += f"，{len(tips)} 个笔尖素材"
             refs.append(BrushRef(
-                name=n.name, key=n.uuid.hex(), group="/".join(p for p in n.path if p),
+                name=n.name, key=n.uuid.hex(), group=join_group(*n.path),
                 loader=(lambda n=n: load_installed_brush(snap, n, root, todb)),
                 thumbnail=(lambda t=tips[:1]: resolve(t[0]) if t else None),
                 detail=detail))

@@ -26,7 +26,7 @@ from typing import Any, Optional
 import numpy as np
 from PIL import Image
 
-from ..core.model import Brush, BrushRef, BrushSource, Texture, WetMix
+from ..core.model import Brush, BrushRef, BrushSource, Texture, WetMix, join_group
 from ..core.plugin import FileInfo, Fix, FormatCodec, register_codec
 from ..core.system import backup, documents_dir, safe_filename, unique_path
 
@@ -1297,7 +1297,7 @@ def list_settings(root: Path, include_textures: bool = True) -> list[BrushRef]:
                     return None
 
             refs.append(BrushRef(name=label, key=f"custool/{cat}/{f.name}",
-                                 group=f"自定义工具·{cat_label}" + (f"·{group}" if group else ""),
+                                 group=join_group("自定义工具", cat_label, group),
                                  loader=loader, thumbnail=thumb,
                                  detail=f"{TOOL_LABELS.get(tid, tid)}工具" + ("" if group else "（未分组）")))
     kinds = ["scatter", "brshape", "bristle", "blotmap"] + (list(TEXTURE_KINDS) if include_textures else [])
@@ -1307,7 +1307,7 @@ def list_settings(root: Path, include_textures: bool = True) -> list[BrushRef]:
                 continue
             for f in sorted(d.glob("*.bmp")):
                 rel = f.relative_to(root).as_posix()
-                refs.append(BrushRef(name=f.stem, key=rel, group=ASSET_LABELS[kind],
+                refs.append(BrushRef(name=f.stem, key=rel, group=join_group("素材", ASSET_LABELS[kind]),
                                      loader=(lambda f=f, k=kind: brush_from_asset(f, k)), thumbnail=_thumb(f, kind),
                                      detail=ASSET_LABELS[kind] + ("（含参数 INI）" if f.with_suffix(".ini").is_file() else "")))
     return refs

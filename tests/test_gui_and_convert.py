@@ -113,12 +113,12 @@ def test_grid_checking_updates_count(qapp, win):
     assert t.model.checked == {1, 2, 4}
 
     # select all / none / invert act on the filtered rows only
-    t.group.setCurrentIndex(t.group.findData("g"))  # odd rows
+    t.group.select_group("g")  # odd rows
     t._check_all(True)
     assert t.model.checked == {1, 2, 4} | set(range(1, 20, 2))
     t._invert()
     assert t.model.checked == {2, 4}
-    t.group.setCurrentIndex(0)
+    t.group.select_group(None)
     t._check_all(False)
     assert not t.model.checked and t.count.text() == "已选 0 个"
 
@@ -166,9 +166,9 @@ def test_grid_large_library_is_virtualised(qapp, win):
     t.search.setText("b1")
     n = t.proxy.rowCount()
     t.search.setText("")
-    t.group.setCurrentIndex(t.group.findData("g"))
+    t.group.select_group("g")
     assert t.proxy.rowCount() == 2500
-    t.group.setCurrentIndex(0)
+    t.group.select_group(None)
     assert time.perf_counter() - t0 < 0.5
     assert n == 1111 and t.proxy.rowCount() == 5000
     t0 = time.perf_counter()
@@ -230,3 +230,32 @@ def test_targets_offer_csp(qapp, win):
     t.target.setCurrentIndex(i)
     t.set_detected([DetectedApp(app("csp"), AppInstall("csp", "Clip Studio Paint", "4.0.0"))])
     assert t.target.currentData()[0] == "codec" and t.target.currentData()[1].id == "csp"
+
+
+def test_group_tree_nested(qapp, win):
+    gui, w = win
+    t = w.transfer
+    groups = ["笔刷包 / B / 常用", "", "笔刷包 / B / 叠加", "笔刷包 / A", "基础", "笔刷包 / B / 常用"]
+    refs = [BrushRef(name=f"n{i}", key=str(i), group=g) for i, g in enumerate(groups)]
+    t._show_refs(refs, "file", None)
+    assert not t.group.isHidden()
+    root = t.group.topLevelItem(0)
+    assert root.text(0) == "全部笔刷（6）"
+    # the app's own order is kept (not sorted), sub groups nest, counts include sub groups
+    assert [root.child(i).text(0) for i in range(root.childCount())] == ["笔刷包（4）", "基础（1）", "未分组（1）"]
+    pack = root.child(0)
+    assert [pack.child(i).text(0) for i in range(pack.childCount())] == ["B（3）", "A（1）"]
+    assert [pack.child(0).child(i).text(0) for i in range(2)] == ["常用（2）", "叠加（1）"]
+
+    t.group.select_group("笔刷包 / B")
+    assert sorted(t.proxy.source_rows()) == [0, 2, 5]
+    t.group.select_group("笔刷包")
+    assert sorted(t.proxy.source_rows()) == [0, 2, 3, 5]
+    t.group.select_group("")
+    assert t.proxy.source_rows() == [1]
+    t.group.select_group(None)
+    assert t.proxy.rowCount() == 6
+
+    # flat sources hide the tree
+    t._show_refs([BrushRef(name="x", key="0")], "file", None)
+    assert t.group.isHidden()

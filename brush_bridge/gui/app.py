@@ -23,7 +23,8 @@ from ..core.convert import DetectedApp, OpenedFile
 from ..core.model import BrushRef
 from ..core.plugin import FileInfo, codecs, load_plugins
 from ..core.system import export_dir, open_in_explorer
-from .brush_grid import THUMB, BrushGridView, BrushListModel, PixmapCache, ThumbnailLoader, pil_to_qimage
+from .brush_grid import (THUMB, BrushGridView, BrushListModel, GroupTree, PixmapCache, ThumbnailLoader,
+                         pil_to_qimage)
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ QTabBar::tab:selected { font-weight: bold; }
 QListWidget#sources { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 4px; }
 QListWidget#sources::item { padding: 7px 6px; border-radius: 4px; }
 QListWidget#sources::item:selected { background: #2f6fed; color: white; }
+QTreeWidget#groups { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 4px; }
+QTreeWidget#groups::item { padding: 4px 2px; }
+QTreeWidget#groups::item:selected { background: #2f6fed; color: white; border-radius: 4px; }
 QListView#grid { background: white; border: 1px solid #ddd; border-radius: 6px; }
 QPushButton { padding: 6px 14px; border-radius: 5px; border: 1px solid #c8c8d0; background: white; }
 QPushButton:hover { background: #eef2fb; }
@@ -177,17 +181,22 @@ class TransferPage(QWidget):
         self.search.textChanged.connect(self._filter)
         self.search.setMaximumWidth(220)
         head.addWidget(self.search)
-        self.group = QComboBox()
-        self.group.setMinimumWidth(160)
-        self.group.currentIndexChanged.connect(self._filter)
-        head.addWidget(self.group)
         rv.addLayout(head)
 
         self.grid = BrushGridView(self.model, parent=self)
         self.grid.setObjectName("grid")
         self.grid.checkAllRequested.connect(lambda: self._check_all(True))
         self.proxy = self.grid.proxy
-        rv.addWidget(self.grid, 1)
+        self.group = GroupTree()
+        self.group.groupChanged.connect(self._filter)
+        self.group.setVisible(False)
+        body = QSplitter(Qt.Horizontal)
+        body.setChildrenCollapsible(False)
+        body.addWidget(self.group)
+        body.addWidget(self.grid)
+        body.setStretchFactor(1, 1)
+        body.setSizes([210, 700])
+        rv.addWidget(body, 1)
         self.status = QLabel("")
         self.status.setObjectName("hint")
         rv.addWidget(self.status)
@@ -376,14 +385,8 @@ class TransferPage(QWidget):
         ns = self._source_ns(kind, obj) if obj is not None else None
         self.model.set_refs(refs, ns)
         log.info("showing %d brushes from %s", len(refs), ns)
-        groups = sorted({r.group for r in refs if r.group})
-        self.group.blockSignals(True)
-        self.group.clear()
-        self.group.addItem("全部分组", None)
-        for g in groups:
-            self.group.addItem(g, g)
-        self.group.setVisible(bool(groups))
-        self.group.blockSignals(False)
+        self.group.set_groups(r.group for r in refs)
+        self.group.setVisible(self.group.has_groups)
         self.empty_msg = "没有找到笔刷。"
         if not refs and kind == "app" and obj is not None and obj.adapter.id == "procreate":
             self.empty_msg = "Procreate 只在 iPad 上运行：请在 iPad 上分享笔刷，把 .brushset / .brush 文件传到电脑后拖进来。"
@@ -393,7 +396,7 @@ class TransferPage(QWidget):
 
     # selection -------------------------------------------------------------------------------
     def _filter(self, *_):
-        self.proxy.set_filter(self.search.text(), self.group.currentData())
+        self.proxy.set_filter(self.search.text(), self.group.current_group())
         total, shown = len(self.refs), self.proxy.rowCount()
         if not total:
             self.status.setText(getattr(self, "empty_msg", "没有找到笔刷。"))

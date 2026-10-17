@@ -14,6 +14,18 @@ from typing import Any, Callable, Optional
 
 from PIL import Image
 
+#: Separator between levels of ``Brush.group`` / ``BrushRef.group`` (e.g. "毛笔 / 水彩").
+GROUP_SEP = " / "
+
+
+def join_group(*parts: str) -> str:
+    """Build a group path from its levels, dropping empty ones."""
+    return GROUP_SEP.join(p.strip() for p in parts if p and p.strip())
+
+
+def split_group(group: str) -> list[str]:
+    return [p for p in (group or "").split(GROUP_SEP) if p]
+
 
 @dataclass
 class Dynamic:
