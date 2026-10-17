@@ -17,7 +17,8 @@ from typing import Callable, Optional
 
 from PIL import Image
 
-from ..core.model import Brush, BrushSource, ColorDynamics, Dynamic, DualTip, Texture, WetMix, join_group
+from ..core.model import (Brush, BrushSource, ColorDynamics, Dynamic, DualTip, EdgeEffect, Texture, WetMix,
+                          join_group)
 from ..core.plugin import FileInfo, FormatCodec, Fix, register_codec
 from ..core.system import safe_filename, unique_path
 from . import csp_schema as S
@@ -54,16 +55,76 @@ def to_px(value, unit) -> float:
     return float(value or 0.0) * _UNIT_TO_PX.get(int(unit or 0), 1.0)
 
 
+def _identity(pts) -> bool:
+    return not pts or all(abs(x - y) < 1e-3 for x, y in pts)
+
+
 def _dyn(blob) -> Dynamic:
     e = decode_effector(blob)
     if not e:
         return Dynamic()
+    curve = list(e.pressure_curve) if e.enabled & EFF_PRESSURE and not _identity(e.pressure_curve) else []
     return Dynamic(pressure=e.influence(EFF_PRESSURE), tilt=e.influence(EFF_TILT),
-                   velocity=e.influence(EFF_VELOCITY), jitter=e.influence(EFF_RANDOM))
+                   velocity=e.influence(EFF_VELOCITY), jitter=e.influence(EFF_RANDOM), pressure_curve=curve)
 
 
 def _enc(d: Dynamic) -> bytes:
-    return encode_effector(d.pressure, d.tilt, d.velocity, d.jitter)
+    return encode_effector(d.pressure, d.tilt, d.velocity, d.jitter, pressure_curve=d.pressure_curve)
+
+
+# Colour channels: (neutral name, CSP column stem, CSP units per 1.0 of the neutral value)
+_COLOR_CHANNELS = (("hue", "Hue", 180), ("saturation", "Saturation", 100), ("brightness", "Value", 100))
+
+
+def color_channel(down: float, up: float, shift: float, source: str = "",
+                  curve: Optional[list] = None) -> tuple[float, bytes]:
+    """CSP colour change amount (-1..1) and effector for one channel.
+
+    The target range is ``[shift - down, shift + up]``; with ``source`` "pressure" it is reached at
+    the lightest pressure (CSP gets the inverted curve), with "tilt" at full tilt input. CSP evaluates
+    ``amount * input * r`` with ``r`` uniformly random in ``[random_min, 1]``, so the amount is the
+    range end with the larger magnitude and ``random_min`` is the other end relative to it.
+    """
+    lo, hi = shift - max(down, 0.0), shift + max(up, 0.0)
+    amount = hi if abs(hi) >= abs(lo) else lo
+    if abs(amount) < 1e-4:
+        return 0.0, encode_effector()
+    other = lo if amount == hi else hi
+    rmin = int(round(100 * other / amount))
+    jitter = 1.0 if rmin < 100 else 0.0
+    if source == "pressure":
+        # the shift lives at light pressure: CSP gets the inverted curve 1 - c(p)
+        curve = _invert_curve(curve)
+    eff = encode_effector(pressure=1.0 if source == "pressure" else 0.0, tilt=1.0 if source == "tilt" else 0.0,
+                          jitter=jitter, pressure_curve=curve, random_min=rmin)
+    return amount, eff
+
+
+def _invert_curve(curve: Optional[list]) -> list:
+    pts = list(curve) if curve else [(0.0, 0.0), (1.0, 1.0)]
+    return [(float(x), _clamp(1.0 - float(y))) for x, y in pts]
+
+
+def read_color_channel(amount: float, blob) -> tuple[float, float, float, str, list]:
+    """Inverse of :func:`color_channel`: (down, up, shift, source, curve)."""
+    e = decode_effector(blob)
+    if e is None or amount == 0:
+        return 0.0, max(amount, 0.0), 0.0, "", []
+    source = "pressure" if e.enabled & EFF_PRESSURE else "tilt" if e.enabled & EFF_TILT else ""
+    if not e.enabled & (EFF_PRESSURE | EFF_TILT | EFF_RANDOM):
+        # constant offset (or files from older brush-bridge versions): treat as a jitter range
+        return max(-amount, 0.0), max(amount, 0.0), 0.0, "", []
+    other = amount * (e.random_min / 100.0 if e.enabled & EFF_RANDOM else 1.0)
+    lo, hi = min(amount, other), max(amount, other)
+    curve = []
+    if source == "pressure":
+        curve = _invert_curve(e.pressure_curve or [(0.0, 0.0), (1.0, 1.0)])
+        if _identity(curve):
+            curve = []
+    if source:
+        mid = (lo + hi) / 2
+        return mid - lo, hi - mid, mid, source, curve
+    return max(-lo, 0.0), max(hi, 0.0), 0.0, "", []
 
 
 def _num(v, default=0.0) -> float:
@@ -203,19 +264,32 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
             mode=COMPOSITE_TO_BLEND.get(int(v.get("DualBrushCompositeMode") or 0), "multiply"),
             name=drefs[0].name if drefs else "")
 
-    # Colour jitter
+    # Colour jitter ("色の揺らぎ"); per-tip channels may also follow pressure / tilt
     if int(v.get("BrushChangePatternColor") or 0):
-        b.color = ColorDynamics(
-            fg_bg_jitter=_clamp(_num(v.get("BrushSubColor")) / 100),
-            hue_jitter=_clamp(_num(v.get("BrushHueChange")) / 180),
-            saturation_jitter=_clamp(_num(v.get("BrushSaturationChange")) / 100),
-            brightness_jitter=_clamp(_num(v.get("BrushValueChange")) / 100), per_tip=True)
-    elif int(v.get("BrushChangeStrokeColor") or 0):
-        b.color = ColorDynamics(
+        col = ColorDynamics(fg_bg_jitter=_clamp(_num(v.get("BrushSubColor")) / 100), per_tip=True)
+        for ch, stem, unit in _COLOR_CHANNELS:
+            down, up, shift, source, curve = read_color_channel(
+                _num(v.get(f"Brush{stem}Change")) / unit, v.get(f"Brush{stem}ChangeEffector"))
+            if source:
+                setattr(col, f"{ch}_{source}", _clamp(shift, -1))
+                if curve:
+                    col.pressure_curves[ch] = curve
+            jit = _clamp(max(down, up))
+            setattr(col, f"{ch}_jitter", jit)
+            if ch == "brightness" and abs(down - up) > 1e-3:
+                col.brightness_up, col.brightness_down = _clamp(up), _clamp(down)
+        b.color = col
+    if int(v.get("BrushChangeStrokeColor") or 0) and not b.color.has_jitter():
+        stroke = ColorDynamics(
             fg_bg_jitter=_clamp(_num(v.get("BrushStrokeSubColor")) / 100),
-            hue_jitter=_clamp(_num(v.get("BrushStrokeHueChange")) / 180),
-            saturation_jitter=_clamp(_num(v.get("BrushStrokeSaturationChange")) / 100),
-            brightness_jitter=_clamp(_num(v.get("BrushStrokeValueChange")) / 100), per_tip=False)
+            hue_jitter=_clamp(abs(_num(v.get("BrushStrokeHueChange"))) / 180),
+            saturation_jitter=_clamp(abs(_num(v.get("BrushStrokeSaturationChange"))) / 100),
+            brightness_jitter=_clamp(abs(_num(v.get("BrushStrokeValueChange"))) / 100), per_tip=False)
+        for ch, _stem, _unit in _COLOR_CHANNELS:  # keep the per-tip pressure / tilt shifts
+            for src in ("pressure", "tilt"):
+                setattr(stroke, f"{ch}_{src}", getattr(b.color, f"{ch}_{src}"))
+        stroke.pressure_curves = dict(b.color.pressure_curves)
+        b.color = stroke
 
     # Colour mixing
     if int(v.get("BrushUseWaterColor") or 0):
@@ -224,7 +298,12 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
                        wetness=_clamp(1 - _num(v.get("BrushMixAlpha"), 50) / 100),
                        color_stretch=_clamp(_num(v.get("BrushMixColorExtension")) / 100))
     if int(v.get("BrushUseWaterEdge") or 0):
-        b.warn("Clip Studio Paint 的“水彩边界”效果在其他软件中没有对应项，已忽略。")
+        b.edge = EdgeEffect(
+            opacity=_clamp(_num(v.get("BrushWaterEdgeAlphaPower"), 20) / 100),
+            darken=_clamp(_num(v.get("BrushWaterEdgeValuePower")) / 100),
+            width_px=to_px(v.get("BrushWaterEdgeRadius", 3.0), v.get("BrushWaterEdgeRadiusUnit")),
+            blur_px=to_px(v.get("BrushWaterEdgeBlur"), v.get("BrushWaterEdgeBlurUnit")),
+            after_stroke=bool(int(v.get("BrushWaterEdgeAfterDrag") or 0)))
     if int(v.get("BrushUseRevision") or 0):
         b.stabilization = max(b.stabilization, _clamp(_num(v.get("BrushRevision")) / 100))
     return b
@@ -281,15 +360,45 @@ def brush_columns(b: Brush) -> dict[str, object]:
         "BrushMixColorExtension": int(round(_clamp(b.wet.color_stretch) * 100)),
     }
     col = b.color
-    per_tip = col.is_active() and col.per_tip
-    per_stroke = col.is_active() and not col.per_tip
-    pre = "Brush" if per_tip else "BrushStroke"
-    c.update({"BrushChangePatternColor": int(per_tip), "BrushChangeStrokeColor": int(per_stroke)})
-    if col.is_active():
-        c.update({f"{pre}HueChange": int(round(_clamp(col.hue_jitter) * 180)),
-                  f"{pre}SaturationChange": int(round(_clamp(col.saturation_jitter) * 100)),
-                  f"{pre}ValueChange": int(round(_clamp(col.brightness_jitter) * 100)),
-                  f"{pre}SubColor": int(round(_clamp(col.fg_bg_jitter) * 100))})
+    tip_jitter = col.has_jitter() and col.per_tip
+    stroke_jitter = col.has_jitter() and not col.per_tip
+    c.update({"BrushChangePatternColor": int(tip_jitter or col.has_shift()),
+              "BrushChangeStrokeColor": int(stroke_jitter)})
+    if tip_jitter or col.has_shift():
+        for ch, stem, unit in _COLOR_CHANNELS:
+            jit = _clamp(getattr(col, f"{ch}_jitter")) if tip_jitter else 0.0
+            up = down = jit
+            if ch == "brightness" and tip_jitter:
+                up = _clamp(col.brightness_up if col.brightness_up is not None else jit)
+                down = _clamp(col.brightness_down if col.brightness_down is not None else jit)
+            sp, st = getattr(col, f"{ch}_pressure"), getattr(col, f"{ch}_tilt")
+            source, shift = ("pressure", sp) if abs(sp) >= abs(st) else ("tilt", st)
+            if abs(shift) < 1e-4:
+                source, shift = "", 0.0
+            elif abs(sp) > 1e-4 and abs(st) > 1e-4:
+                b.warn(f"Clip Studio Paint 的颜色变化只能跟随一种输入，"
+                       f"{'色相' if ch == 'hue' else '饱和度' if ch == 'saturation' else '亮度'}"
+                       f"已只保留{'压力' if source == 'pressure' else '倾斜'}的影响。")
+            amount, eff = color_channel(down, up, shift, source, col.pressure_curves.get(ch))
+            c[f"Brush{stem}Change"] = int(round(max(-1.0, min(1.0, amount)) * unit))
+            c[f"Brush{stem}ChangeEffector"] = eff
+        sub = _clamp(col.fg_bg_jitter) if tip_jitter else 0.0
+        c["BrushSubColor"] = int(round(sub * 100))
+        c["BrushSubColorEffector"] = encode_effector(jitter=1.0) if sub > 0 else encode_effector()
+    if stroke_jitter:
+        c.update({"BrushStrokeHueChange": int(round(_clamp(col.hue_jitter) * 180)),
+                  "BrushStrokeSaturationChange": int(round(_clamp(col.saturation_jitter) * 100)),
+                  "BrushStrokeValueChange": int(round(_clamp(col.brightness_jitter) * 100)),
+                  "BrushStrokeSubColor": int(round(_clamp(col.fg_bg_jitter) * 100))})
+    e = b.edge
+    c["BrushUseWaterEdge"] = int(e.is_active())
+    if e.is_active():
+        width = e.width_px if e.width_px > 0 else max(1.0, min(20.0, b.size_px * 0.05))
+        c.update({"BrushWaterEdgeRadius": round(width, 2), "BrushWaterEdgeRadiusUnit": 0,
+                  "BrushWaterEdgeAlphaPower": int(round(_clamp(e.opacity) * 100)),
+                  "BrushWaterEdgeValuePower": int(round(_clamp(e.darken) * 100)),
+                  "BrushWaterEdgeBlur": round(max(0.0, e.blur_px), 2), "BrushWaterEdgeBlurUnit": 0,
+                  "BrushWaterEdgeAfterDrag": int(e.after_stroke)})
     t = b.texture
     if t is not None:
         c.update({"TextureScale2": round(t.scale * 100, 2), "TextureDensity": int(round(_clamp(t.depth) * 100)),

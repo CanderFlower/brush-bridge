@@ -300,6 +300,25 @@ def test_shape_and_grain_image_rules():
     assert seam_x < inner * 3 + 1 and seam_y < np.abs(np.diff(a, axis=0)).mean() * 3 + 1
 
 
+def test_effects_mapping_roundtrip():
+    p = pc.template_params("效果")
+    p.update({"burntEdgesAmount": 0.3, "wetEdgesAmount": 0.1, "dynamicsPressureSaturation": 0.2,
+              "dynamicsPressureBrightness": -0.1, "dynamicsPressureHue": 0.25, "dynamicsTiltSaturation": 0.4,
+              "dynamicsTiltBleed": 0.3, "dynamicsPressureSize": 0.9})
+    b = pc.params_to_brush(p, shape=None, grain=None, thumb=None)
+    assert b.edge.is_active() and b.edge.darken == pytest.approx(0.3) and b.edge.blur_px > 0
+    # Procreate: positive saturation = paler at light pressure; hue 100% = full spectrum
+    assert b.color.saturation_pressure == pytest.approx(-0.2) and b.color.saturation_tilt == pytest.approx(-0.4)
+    assert b.color.brightness_pressure == pytest.approx(-0.1) and b.color.hue_pressure == pytest.approx(0.5)
+    assert b.color.has_shift() and not b.color.has_jitter()
+    assert b.flow_dynamic.tilt > 0
+
+    q = pc.brush_to_params(b, has_grain=False)
+    for k in ("burntEdgesAmount", "wetEdgesAmount", "dynamicsPressureSaturation", "dynamicsPressureBrightness",
+              "dynamicsPressureHue", "dynamicsTiltSaturation"):
+        assert q[k] == pytest.approx(p[k], abs=1e-6), k
+
+
 def test_unsupported_features_warn():
     b = _brush(tips=[_tip(), _tip(40, 40)], roundness_jitter=0.3, is_eraser=True,
                blend_mode="hue_shift_of_doom")

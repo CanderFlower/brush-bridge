@@ -75,17 +75,28 @@ def decode_effector(blob) -> Optional[Effector]:
 
 
 def encode_effector(pressure: float = 0.0, tilt: float = 0.0, velocity: float = 0.0,
-                    jitter: float = 0.0) -> bytes:
-    """Build a 0x2c-header effector (the layout CSP 1.x .. 5.x all read) with a linear curve."""
+                    jitter: float = 0.0, *, pressure_curve: Optional[list[tuple[float, float]]] = None,
+                    random_min: Optional[int] = None) -> bytes:
+    """Build a 0x2c-header effector (the layout CSP 1.x .. 5.x all read).
+
+    ``random_min`` overrides the random input's minimum in percent (-100..100; CSP's colour
+    jitter uses -100, i.e. a two-sided range). ``pressure_curve`` defaults to a straight line.
+    """
     enabled = 0
     mins = []
     for bit, val in ((EFF_PRESSURE, pressure), (EFF_TILT, tilt), (EFF_VELOCITY, velocity), (EFF_RANDOM, jitter)):
         if val > 0:
             enabled |= bit
         mins.append(int(round(100 * (1.0 - max(0.0, min(1.0, val))))) if val > 0 else 0)
+    if random_min is not None and enabled & EFF_RANDOM:
+        mins[3] = int(max(-100, min(100, round(random_min))))
     curve = b""
     if enabled & EFF_PRESSURE:
-        curve = struct.pack(">III", 0x0C, 2, 0x10) + struct.pack(">dddd", 0.0, 0.0, 1.0, 1.0)
+        pts = sorted((max(0.0, min(1.0, float(x))), max(0.0, min(1.0, float(y))))
+                     for x, y in (pressure_curve or [])) or [(0.0, 0.0), (1.0, 1.0)]
+        if len(pts) < 2:
+            pts = [(0.0, 0.0), (1.0, 1.0)]
+        curve = struct.pack(">III", 0x0C, len(pts), 0x10) + b"".join(struct.pack(">dd", x, y) for x, y in pts)
     head = struct.pack(">11i", 0x2C, 0xF0, enabled, *mins, 0, len(curve), 0, 100)
     return head + curve
 

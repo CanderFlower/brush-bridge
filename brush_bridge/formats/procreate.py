@@ -35,7 +35,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from ..core.imaging import pad_square, round_tip, stroke_preview
-from ..core.model import Brush, BrushRef, BrushSource, ColorDynamics, Dynamic, Texture, WetMix
+from ..core.model import Brush, BrushRef, BrushSource, ColorDynamics, Dynamic, EdgeEffect, Texture, WetMix
 from ..core.plugin import FileInfo, FormatCodec, register_codec
 
 log = logging.getLogger(__name__)
@@ -421,6 +421,25 @@ def _f(p: dict, key: str, default: float = 0.0) -> float:
         return default
 
 
+def _curve(p: dict, key: str) -> list[tuple[float, float]]:
+    """Points of a ValkyrieMagnitudinalCurve; [] when missing or the identity line."""
+    v = p.get(key)
+    pts = v.get("points") if isinstance(v, dict) else None
+    try:
+        out = [(_clamp(x), _clamp(y)) for x, y in pts or []]
+    except (TypeError, ValueError):
+        return []
+    out.sort()
+    if len(out) < 2 or all(abs(x - y) < 1e-3 for x, y in out):
+        return []
+    return out
+
+
+def _set_curve(p: dict, key: str, pts: list[tuple[float, float]]) -> None:
+    if pts and len(pts) >= 2:
+        p[key] = {"$class": "ValkyrieMagnitudinalCurve", "points": [(float(x), float(y)) for x, y in pts]}
+
+
 # GUI conversions documented by aumlette-lab/procreate-brush-decoder
 def jitter_raw_to_fraction(raw: float) -> float:
     return 0.606919 * max(raw, 0.0) ** 0.4545 if raw > 0 else 0.0
@@ -622,12 +641,33 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
     br.size_dynamic = Dynamic(pressure=signed("dynamicsPressureSize", "压力-大小"),
                               tilt=_clamp(_f(p, "dynamicsTiltSize")),
                               velocity=signed("dynamicsSpeedSize", "速度-大小"),
-                              jitter=_clamp(_f(p, "dynamicsJitterSize")))
+                              jitter=_clamp(_f(p, "dynamicsJitterSize")),
+                              pressure_curve=_curve(p, "dynamicsPressureSizeCurve"))
     br.opacity_dynamic = Dynamic(pressure=_clamp(_f(p, "dynamicsPressureOpacityTransfer")),
                                  tilt=_clamp(_f(p, "dynamicsTiltOpacity")),
                                  velocity=signed("dynamicsSpeedOpacity", "速度-不透明度"),
                                  jitter=_clamp(_f(p, "dynamicsJitterOpacity")))
-    br.flow_dynamic = Dynamic(pressure=signed("dynamicsPressureOpacity", "压力-流量"))
+    br.flow_dynamic = Dynamic(pressure=signed("dynamicsPressureOpacity", "压力-流量"),
+                              pressure_curve=_curve(p, "dynamicsPressureOpacityCurve"))
+
+    # Bleed thins the paint (lighter, broken edges) at low pressure / when tilted; gradation fades the
+    # stamp when tilted. Both become paint density (flow) responding to pressure / tilt.
+    bleed_p = _clamp(abs(_f(p, "dynamicsPressureBleed")))
+    bleed_t = _clamp(abs(_f(p, "dynamicsTiltBleed")) + abs(_f(p, "dynamicsTiltGradation")))
+    if bleed_p > 0.001 and bleed_p > br.flow_dynamic.pressure:
+        br.flow_dynamic.pressure = bleed_p
+        br.flow_dynamic.pressure_curve = _curve(p, "dynamicsPressureBleedCurve")
+    if bleed_t > 0.001:
+        br.flow_dynamic.tilt = _clamp(max(br.flow_dynamic.tilt, bleed_t))
+    if bleed_p > 0.001 or bleed_t > 0.001:
+        br.warn("Procreate 的“渗流/渐变”（压力、倾斜）已近似为“流量（浓度）随压力/倾斜变化”。")
+
+    # Wet edges / burnt edges -> edge effect (CSP "watercolor edge")
+    wet_e = _clamp(_f(p, "wetEdgesAmount"))
+    burnt = _clamp(_f(p, "burntEdgesAmount"))
+    if wet_e > 0.001 or burnt > 0.001:
+        br.edge = EdgeEffect(opacity=_clamp(wet_e + burnt * 0.5), darken=burnt,
+                             blur_px=round(wet_e * 4.0, 2))
 
     # --- paint --------------------------------------------------------------------------------
     max_o = _clamp(_f(p, "maxOpacity", 1.0))
@@ -661,11 +701,13 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
         br.warn(f"该笔刷使用了 Procreate 内置纹理「{bundled_grain}」，文件中不包含该图像，纹理已丢失。")
 
     # --- colour / wet mix ---------------------------------------------------------------------
+    light, dark = _clamp(_f(p, "dynamicsJitterLightness")), _clamp(_f(p, "dynamicsJitterDarkness"))
     stamp = ColorDynamics(fg_bg_jitter=_clamp(_f(p, "jitterSecondary")),
                           hue_jitter=_clamp(_f(p, "dynamicsJitterHue")),
                           saturation_jitter=_clamp(_f(p, "dynamicsJitterSaturation")),
-                          brightness_jitter=_clamp(max(_f(p, "dynamicsJitterLightness"),
-                                                       _f(p, "dynamicsJitterDarkness"))),
+                          brightness_jitter=max(light, dark),
+                          brightness_up=light if abs(light - dark) > 1e-4 else None,
+                          brightness_down=dark if abs(light - dark) > 1e-4 else None,
                           per_tip=True)
     stroke = ColorDynamics(fg_bg_jitter=_clamp(_f(p, "jitterStrokeSecondary")),
                            hue_jitter=_clamp(_f(p, "dynamicsJitterStrokeHue")),
@@ -676,6 +718,16 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
     br.color = stamp if stamp.is_active() or not stroke.is_active() else stroke
     if stamp.is_active() and stroke.is_active():
         br.warn("Procreate 同时设置了“图章颜色抖动”和“笔画颜色抖动”，只保留了图章颜色抖动。")
+    # Colour driven by pressure / tilt. Procreate shifts the colour at light pressure and reaches the
+    # chosen colour at full pressure: saturation 100% = white -> saturated, brightness 100% = lighter
+    # at light pressure, hue 100% = the whole spectrum (360 degrees).
+    for ch, label, sign, scale in (("hue", "Hue", 1.0, 2.0), ("saturation", "Saturation", -1.0, 1.0),
+                                   ("brightness", "Brightness", 1.0, 1.0)):
+        setattr(br.color, f"{ch}_pressure", _clamp(sign * scale * _f(p, f"dynamicsPressure{label}"), -1.0, 1.0))
+        setattr(br.color, f"{ch}_tilt", _clamp(sign * scale * _f(p, f"dynamicsTilt{label}"), -1.0, 1.0))
+        cv = _curve(p, f"dynamicsPressure{label}Curve")
+        if cv:
+            br.color.pressure_curves[ch] = cv
 
     dilution = _clamp(_f(p, "dynamicsMix"))
     recursive = bool(p.get("renderingRecursiveMixing"))
@@ -686,12 +738,7 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
 
     # --- things the neutral model cannot express ----------------------------------------------
     unsupported = [
-        ("wetEdgesAmount", "湿边"), ("burntEdgesAmount", "灼边"), ("dynamicsBlur", "模糊"),
-        ("dynamicsFalloff", "渐隐（Fall off）"), ("dynamicsPressureBleed", "压力-渗流"),
-        ("dynamicsTiltBleed", "倾斜-渗流"), ("dynamicsTiltGradation", "倾斜-渐变"),
-        ("dynamicsPressureHue", "压力-色相"), ("dynamicsPressureSaturation", "压力-饱和度"),
-        ("dynamicsPressureBrightness", "压力-亮度"), ("dynamicsTiltHue", "倾斜-色相"),
-        ("dynamicsTiltSaturation", "倾斜-饱和度"), ("dynamicsTiltBrightness", "倾斜-亮度"),
+        ("dynamicsBlur", "模糊"), ("dynamicsFalloff", "渐隐（Fall off）"),
         ("metallicAmount", "3D 金属度"), ("dynamicsPressureMix", "湿混-侵染（Attack）"),
     ]
     for key, label in unsupported:
@@ -759,8 +806,18 @@ def brush_to_params(br: Brush, *, has_grain: bool) -> dict[str, Any]:
     _set(p, "dynamicsSpeedOpacity", _clamp(br.opacity_dynamic.velocity))
     _set(p, "dynamicsJitterOpacity", _clamp(br.opacity_dynamic.jitter))
     _set(p, "dynamicsPressureOpacity", _clamp(br.flow_dynamic.pressure))
+    _set_curve(p, "dynamicsPressureSizeCurve", br.size_dynamic.pressure_curve)
+    _set_curve(p, "dynamicsPressureOpacityCurve", br.flow_dynamic.pressure_curve)
     if br.size_dynamic.tilt > 0 or br.opacity_dynamic.tilt > 0:
         _set(p, "dynamicsTiltAngle", 0.5)
+    if br.flow_dynamic.tilt > 0:
+        _set(p, "dynamicsTiltBleed", _clamp(br.flow_dynamic.tilt))
+        _set(p, "dynamicsTiltAngle", 0.5)
+
+    e = br.edge
+    if e.is_active():
+        _set(p, "burntEdgesAmount", _clamp(e.darken))
+        _set(p, "wetEdgesAmount", _clamp(e.opacity - e.darken * 0.5))
 
     _set(p, "dynamicsGlazedFlow", _clamp(br.flow, 0.01, 1.0))
     codes = _blend_codes(br.blend_mode)
@@ -799,7 +856,7 @@ def brush_to_params(br: Brush, *, has_grain: bool) -> dict[str, Any]:
         _set(p, "grainBlendMode", gcode)
 
     c = br.color
-    if c.is_active():
+    if c.has_jitter():
         pre_h, pre_s, pre_l, pre_d, sec = (
             ("dynamicsJitterHue", "dynamicsJitterSaturation", "dynamicsJitterLightness",
              "dynamicsJitterDarkness", "jitterSecondary") if c.per_tip else
@@ -807,9 +864,16 @@ def brush_to_params(br: Brush, *, has_grain: bool) -> dict[str, Any]:
              "dynamicsJitterStrokeDarkness", "jitterStrokeSecondary"))
         _set(p, pre_h, _clamp(c.hue_jitter))
         _set(p, pre_s, _clamp(c.saturation_jitter))
-        _set(p, pre_l, _clamp(c.brightness_jitter))
-        _set(p, pre_d, _clamp(c.brightness_jitter))
+        _set(p, pre_l, _clamp(c.brightness_jitter if c.brightness_up is None else c.brightness_up))
+        _set(p, pre_d, _clamp(c.brightness_jitter if c.brightness_down is None else c.brightness_down))
         _set(p, sec, _clamp(c.fg_bg_jitter))
+    for ch, label, sign, scale in (("hue", "Hue", 1.0, 2.0), ("saturation", "Saturation", -1.0, 1.0),
+                                   ("brightness", "Brightness", 1.0, 1.0)):
+        _set(p, f"dynamicsPressure{label}", _clamp(sign * getattr(c, f"{ch}_pressure") / scale, -1.0, 1.0))
+        _set(p, f"dynamicsTilt{label}", _clamp(sign * getattr(c, f"{ch}_tilt") / scale, -1.0, 1.0))
+        _set_curve(p, f"dynamicsPressure{label}Curve", c.pressure_curves.get(ch, []))
+    if any(abs(getattr(c, f"{ch}_tilt")) > 1e-4 for ch in ("hue", "saturation", "brightness")):
+        _set(p, "dynamicsTiltAngle", 0.5)
 
     if br.wet.enabled:
         _set(p, "renderingRecursiveMixing", True)
@@ -830,8 +894,8 @@ def brush_to_params(br: Brush, *, has_grain: bool) -> dict[str, Any]:
         br.warn("Procreate 没有“圆度抖动”，已忽略。")
     if br.is_eraser:
         br.warn("Procreate 的笔刷可同时用于绘画和擦除，不再区分橡皮擦。")
-    if br.flow_dynamic.tilt > 0 or br.flow_dynamic.velocity > 0 or br.flow_dynamic.jitter > 0:
-        br.warn("Procreate 的流量只能受压力控制，倾斜/速度/抖动对流量的影响已忽略。")
+    if br.flow_dynamic.velocity > 0 or br.flow_dynamic.jitter > 0:
+        br.warn("Procreate 的流量只能受压力/倾斜控制，速度/抖动对流量的影响已忽略。")
     return p
 
 

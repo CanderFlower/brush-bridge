@@ -734,7 +734,7 @@ def read_settings(root: Path, categories: tuple[str, ...] = ("nrm", "ink")) -> l
 def choose_mode(b: Brush) -> str:
     """'scatter' (scatter tool + scatter shape), 'brshape' (brush + brush shape) or 'round'."""
     needs_scatter = (b.count > 1 or b.count_jitter > 0 or b.scatter > 0.5 or b.spacing > 0.5
-                     or b.color.is_active())
+                     or b.color.has_jitter())
     if b.is_eraser:
         return "brshape" if b.tips else "round"
     if needs_scatter:
@@ -848,6 +848,7 @@ def _write_warnings(b: Brush, mode: str) -> None:
         b.warn("SAI2 的散布工具不支持混色，已忽略湿画效果。")
     if mode != "scatter" and b.tips and (b.scatter > 0.5 or b.spacing > 0.5):
         b.warn("SAI2 笔刷形状的间距/散布最大 50%，已截断。")
+    b.warn_extras("SAI2")
 
 
 @dataclass

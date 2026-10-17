@@ -871,7 +871,7 @@ def brush_to_preset(br: Brush, sample_id: Optional[str], dual_id: Optional[str],
     p.add("opVr", "Objc", _brvr(br.opacity_dynamic, omins))
     p.add("prVr", "Objc", _brvr(br.flow_dynamic, omins))
     c = br.color
-    p.add("useColorDynamics", "bool", c.is_active())
+    p.add("useColorDynamics", "bool", c.has_jitter())
     p.add("clVr", "Objc", Desc("brVr").add("bVTy", "long", 0).add("fStp", "long", 25)
           .add("jitter", "UntF", ("#Prc", c.fg_bg_jitter * 100)).add("Mnm ", "UntF", ("#Prc", 0.0)))
     p.add("H   ", "UntF", ("#Prc", c.hue_jitter * 100))
@@ -894,6 +894,7 @@ def brush_to_preset(br: Brush, sample_id: Optional[str], dual_id: Optional[str],
     tool.add("usePressureOverridesOpacity", "bool", False)
     tool.add("brushPreset", "bool", True)
     p.add("toolOptions", "Objc", tool)
+    br.warn_extras("Photoshop")
     return p
 
 

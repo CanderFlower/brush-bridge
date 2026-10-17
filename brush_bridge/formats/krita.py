@@ -1074,6 +1074,7 @@ def brush_to_preset(b: Brush, prefix: str, used: set[str]) -> tuple[str, dict[st
         b.warn("Krita 普通笔刷没有“前景/背景色抖动”，已忽略。")
     if b.wet.enabled:
         b.warn("Krita 像素笔刷不支持混色，可在 Krita 中改用“涂抹笔刷”引擎。")
+    b.warn_extras("Krita")
     if b.stabilization > 0 or b.taper_start > 0 or b.taper_end > 0:
         b.warn("防抖/起笔收笔不属于 Krita 笔刷预设，请在 Krita 工具选项中设置。")
 

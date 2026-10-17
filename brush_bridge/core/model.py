@@ -39,6 +39,8 @@ class Dynamic:
     tilt: float = 0.0
     velocity: float = 0.0
     jitter: float = 0.0
+    # response curve for pen pressure as (input, output) points in 0..1; empty == linear
+    pressure_curve: list[tuple[float, float]] = field(default_factory=list)
 
     def is_active(self) -> bool:
         return any(v > 0 for v in (self.pressure, self.tilt, self.velocity, self.jitter))
@@ -71,14 +73,55 @@ class DualTip:
 
 @dataclass
 class ColorDynamics:
+    """Colour variation.
+
+    ``*_jitter`` are random ranges (0..1, applied in both directions). ``*_pressure`` / ``*_tilt``
+    are signed shifts (hue: 1.0 == 180 degrees; saturation and brightness: 1.0 == 100%) applied at
+    the lightest pressure / flattest tilt and fading to the chosen colour at full pressure / upright,
+    like Procreate "Color pressure" / "Color tilt". With a pressure curve ``c`` the shift at pressure
+    ``p`` is ``shift * (1 - c(p))``. They are always per tip.
+    """
+
     fg_bg_jitter: float = 0.0
     hue_jitter: float = 0.0
     saturation_jitter: float = 0.0
     brightness_jitter: float = 0.0
     per_tip: bool = True
+    # asymmetric brightness jitter (Procreate "Lightness" / "Darkness"); None == brightness_jitter
+    brightness_up: Optional[float] = None
+    brightness_down: Optional[float] = None
+    hue_pressure: float = 0.0
+    saturation_pressure: float = 0.0
+    brightness_pressure: float = 0.0
+    hue_tilt: float = 0.0
+    saturation_tilt: float = 0.0
+    brightness_tilt: float = 0.0
+    pressure_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # "hue"/"saturation"/...
+
+    def has_jitter(self) -> bool:
+        return any(v > 0 for v in (self.fg_bg_jitter, self.hue_jitter, self.saturation_jitter, self.brightness_jitter,
+                                   self.brightness_up or 0, self.brightness_down or 0))
+
+    def has_shift(self) -> bool:
+        return any(abs(v) > 1e-4 for v in (self.hue_pressure, self.saturation_pressure, self.brightness_pressure,
+                                           self.hue_tilt, self.saturation_tilt, self.brightness_tilt))
 
     def is_active(self) -> bool:
-        return any(v > 0 for v in (self.fg_bg_jitter, self.hue_jitter, self.saturation_jitter, self.brightness_jitter))
+        return self.has_jitter() or self.has_shift()
+
+
+@dataclass
+class EdgeEffect:
+    """Stroke edge darkening / pooling (CSP "Watercolor edge", Procreate "Wet edges" / "Burnt edges")."""
+
+    opacity: float = 0.0  # 0..1 how much more opaque the rim is than the inside
+    darken: float = 0.0  # 0..1 how much darker the rim is
+    width_px: float = 0.0  # 0 == automatic (from brush size)
+    blur_px: float = 0.0
+    after_stroke: bool = False  # computed once the stroke is finished
+
+    def is_active(self) -> bool:
+        return self.opacity > 1e-3 or self.darken > 1e-3
 
 
 @dataclass
@@ -146,6 +189,7 @@ class Brush:
     dual: Optional[DualTip] = None
     color: ColorDynamics = field(default_factory=ColorDynamics)
     wet: WetMix = field(default_factory=WetMix)
+    edge: EdgeEffect = field(default_factory=EdgeEffect)
 
     preview: Optional[Image.Image] = None
     group: str = ""
@@ -155,6 +199,13 @@ class Brush:
     def warn(self, msg: str) -> None:
         if msg not in self.notes:
             self.notes.append(msg)
+
+    def warn_extras(self, app: str, *, edge: bool = False, color_shift: bool = False) -> None:
+        """Note effects that the target ``app`` cannot store."""
+        if self.edge.is_active() and not edge:
+            self.warn(f"{app} 没有“边缘加深/湿边/灼边”效果，已忽略。")
+        if self.color.has_shift() and not color_shift:
+            self.warn(f"{app} 不支持颜色随压力/倾斜变化（色相/饱和度/亮度），已忽略。")
 
     def main_tip(self) -> Image.Image:
         """First tip, or a rendered computed round tip."""

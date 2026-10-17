@@ -402,6 +402,8 @@ def _warn_lossy(b: Brush) -> None:
         lost.append("双重笔刷")
     if b.color.is_active():
         lost.append("颜色动态")
+    if b.edge.is_active():
+        lost.append("边缘加深/湿边")
     if lost:
         b.warn("GIMP 笔刷文件只保存笔尖形状和间距，" + "、".join(lost) + "需要在 GIMP 的“绘画动态”中自行设置。")
 

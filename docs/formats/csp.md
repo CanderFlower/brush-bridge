@@ -118,9 +118,25 @@ The header is made of u32 words. Its size (word 0) depends on the CSP version:
 
 * **Curve block:** `u32 0x0c, u32 n, u32 0x10`, followed by `n` × (`f64 x`, `f64 y`).
 * **Neutral model:** influence = `1 - minimum/100` for each enabled input.
-* **Writing:** brush-bridge writes the `0x2c` layout with a linear 2-point curve.
-* **Exception:** the hue/saturation/value effectors use a different sign convention
-  (word 4 = 100, word 6 = −100).
+* **Writing:** brush-bridge writes the `0x2c` layout with a linear 2-point curve, or the source
+  pressure curve when it has one.
+* **Colour change effectors** (`Brush{Hue,Saturation,Value,SubColor}ChangeEffector`): the column
+  value is a signed amount (hue ±180, saturation/value ±100) and CSP applies
+  `amount × input × r`, where `r` is uniformly random in `[random_min/100, 1]`. Factory brushes use
+  `random_min = −100` for a two-sided jitter and e.g. 10 for a one-sided one. A negative amount with
+  the effector disabled is a constant shift.
+* **Pressure-driven colour:** Procreate shifts the colour at *light* pressure, so brush-bridge
+  writes the pressure input with the inverted curve `1 − c(p)` (default `[(0,1),(1,0)]`). The
+  range `[shift − down, shift + up]` becomes amount = the end with the larger magnitude and
+  `random_min` = the other end relative to it.
+* Only the per-tip (`BrushChangePatternColor`) columns have effectors; the per-stroke
+  `BrushStroke*Change` columns are plain jitter ranges.
+
+### `BrushInOutTarget` (BLOB, inferred)
+
+`u32 0x0c, u32 count, u32 0x0c`, then `count` × (`u32 id`, `u32 enabled`, `u32 min %`). Seen ids
+are `0x70`, `0x3e9` (probably size), `0x3fd` (probably opacity) and `0x411`. brush-bridge copies
+this blob unchanged.
 
 ### `BrushRotationEffector` (INTEGER bit field, inferred)
 
@@ -250,7 +266,8 @@ textures). The builder reproduces CSP's own `Offscreen` attribute, empty and pix
 | `CompositeMode` | `blend_mode` / `is_eraser` | see below |
 | `AntiAlias` | `antialias` | 0–3 → bool |
 | `Stickness`, `BrushUseRevision/BrushRevision` | `stabilization` | |
-| `BrushUseWaterEdge` | — | warning only |
+| `BrushUseWaterEdge`, `BrushWaterEdgeRadius(+Unit)`, `…AlphaPower`, `…ValuePower`, `…Blur(+Unit)`, `…AfterDrag` | `edge` | opacity = AlphaPower %, darken = ValuePower %; radius defaults to 5 % of the size (1–20 px) |
+| `BrushHue/Saturation/ValueChange` + effector (pressure / tilt bit) | `color.*_pressure`, `color.*_tilt`, `color.pressure_curves` | pressure uses the inverted curve; only one input per channel |
 
 `CompositeMode` follows the layer blend-mode list **(inferred)**:
 

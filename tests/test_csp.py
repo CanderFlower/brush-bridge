@@ -72,6 +72,67 @@ def test_effector_roundtrip():
     assert neutral.enabled == 0 and neutral.pressure_curve == []
 
 
+def test_effector_custom_curve_and_random_min():
+    curve = [(0.0, 1.0), (0.5, 0.3), (1.0, 0.0)]
+    e = decode_effector(encode_effector(pressure=1.0, jitter=1.0, pressure_curve=curve, random_min=-100))
+    assert e.enabled == 0x10 | 0x80 and e.random_min == -100
+    assert e.pressure_curve == [pytest.approx(p, abs=1e-4) for p in curve]
+
+
+def test_color_channel_roundtrip():
+    from brush_bridge.formats.csp import color_channel, read_color_channel
+
+    # symmetric jitter only: two-sided random range
+    amount, eff = color_channel(0.3, 0.3, 0.0)
+    assert amount == pytest.approx(0.3) and decode_effector(eff).random_min == -100
+    assert read_color_channel(amount, eff)[:4] == (pytest.approx(0.3), pytest.approx(0.3), 0.0, "")
+
+    # pressure shift: reached at light pressure through an inverted curve
+    amount, eff = color_channel(0.0, 0.0, -0.2, "pressure")
+    e = decode_effector(eff)
+    assert amount == pytest.approx(-0.2) and e.enabled & 0x10 and not e.enabled & 0x80
+    assert e.pressure_curve == [(0.0, 1.0), (1.0, 0.0)]
+    down, up, shift, source, curve = read_color_channel(amount, eff)
+    assert (source, curve) == ("pressure", []) and shift == pytest.approx(-0.2) and down == up == pytest.approx(0)
+
+    # shift + jitter around it, custom curve survives
+    user = [(0.0, 0.0), (0.5, 0.8), (1.0, 1.0)]
+    amount, eff = color_channel(0.1, 0.1, 0.3, "pressure", user)
+    assert amount == pytest.approx(0.4) and decode_effector(eff).random_min == 50
+    down, up, shift, source, curve = read_color_channel(amount, eff)
+    assert shift == pytest.approx(0.3, abs=0.01) and down == pytest.approx(0.1, abs=0.01)
+    assert curve == [pytest.approx(p, abs=1e-4) for p in user]
+
+    # tilt keeps a direct mapping
+    amount, eff = color_channel(0.0, 0.0, 0.5, "tilt")
+    assert decode_effector(eff).enabled & 0x20 and read_color_channel(amount, eff)[3] == "tilt"
+
+
+def test_edge_and_color_shift_columns(tmp_path):
+    from brush_bridge.core.model import EdgeEffect
+
+    b = Brush(name="效果", size_px=40,
+              color=ColorDynamics(saturation_jitter=0.13, saturation_pressure=-0.13, brightness_pressure=-0.08,
+                                  brightness_down=0.08, brightness_up=0.0, per_tip=True),
+              edge=EdgeEffect(opacity=0.14, darken=0.27))
+    out = CspCodec().write([b], tmp_path / "fx.sut")[0]
+    v = _variant(out)
+    assert v["BrushUseWaterEdge"] == 1 and v["BrushWaterEdgeAlphaPower"] == 14
+    assert v["BrushWaterEdgeValuePower"] == 27 and v["BrushWaterEdgeRadius"] == pytest.approx(2.0)
+    assert v["BrushChangePatternColor"] == 1 and v["BrushChangeStrokeColor"] == 0
+    assert v["BrushSaturationChange"] == -26
+    sat = decode_effector(v["BrushSaturationChangeEffector"])
+    assert sat.enabled & 0x10 and sat.enabled & 0x80 and sat.random_min == 0
+    assert sat.pressure_curve == [(0.0, 1.0), (1.0, 0.0)]
+    assert v["BrushValueChange"] == -16
+
+    r = CspCodec().read(out)[0]
+    assert r.edge.is_active() and r.edge.darken == pytest.approx(0.27) and r.edge.opacity == pytest.approx(0.14)
+    assert r.color.saturation_pressure == pytest.approx(-0.13, abs=0.01)
+    assert r.color.saturation_jitter == pytest.approx(0.13, abs=0.01)
+    assert r.color.brightness_pressure < 0 and not r.color.pressure_curves
+
+
 def test_material_ref_roundtrip():
     refs = [MaterialRef(".:12:69:abc:data:material_0.layer", "笔尖", ".:12:69:abc", 2),
             MaterialRef(".:Paint019:def:data:material_0.layer", "Paper", ".:Install:Paint019:def", 3)]
