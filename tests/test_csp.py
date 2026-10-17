@@ -1,4 +1,4 @@
-"""Tests for Clip Studio Paint support (.sut codec + CSP adapter).
+﻿"""Tests for Clip Studio Paint support (.sut codec + CSP adapter).
 
 Real-world samples are never committed. Point BRUSH_BRIDGE_SAMPLES at a folder containing
 ``sample.sut`` (any sub tool exported from CSP) and/or ``tool.todb`` (a *copy* of
@@ -11,15 +11,17 @@ import shutil
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
-from brush_bridge.core.model import Brush, ColorDynamics, Dynamic, WetMix
+from brush_bridge.core.model import Brush, ColorDynamics, DualTip, Dynamic, Texture, WetMix
 from brush_bridge.core.plugin import AppInstall, load_plugins
 from brush_bridge.formats import csp_schema as S
 from brush_bridge.formats.csp import CspCodec, loses_images
 from brush_bridge.formats.csp_binary import (MaterialRef, decode_effector, decode_material_refs, encode_effector,
-                                             encode_material_refs)
+                                             encode_material_refs, material_members)
+from brush_bridge.formats.csp_material import c2f_unwrap
 
 load_plugins()
 
@@ -139,9 +141,36 @@ def test_eraser_and_custom_tip(tmp_path):
     er = codec.read(files[0])[0]
     assert er.is_eraser
     sq = codec.read(files[1])[0]
-    assert sq.tips == []  # encrypted CSP materials cannot be generated -> round tip + warning
-    assert any("笔尖" in n for n in brushes[1].notes)
-    assert _variant(files[1])["BrushUsePatternImage"] == 0
+    assert len(sq.tips) == 1  # generated (unencrypted) CSP material, read back at full resolution
+    assert np.array_equal(np.asarray(sq.tips[0].convert("L")), np.asarray(tip))
+    v = _variant(files[1])
+    assert v["BrushUsePatternImage"] == 1
+    con = sqlite3.connect(files[1])
+    (fd,) = con.execute("SELECT FileData FROM MaterialFile").fetchone()
+    con.close()
+    members = material_members(fd)
+    assert {"catalog.zip", "info.zip", "data/material_0.layer", "thumbnail/thumbnail.png"} <= set(members)
+    db = tmp_path / "layer.db"
+    db.write_bytes(c2f_unwrap(members["data/material_0.layer"]))
+    lcon = sqlite3.connect(db)
+    assert lcon.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    lcon.close()
+
+
+def test_generated_texture_and_dual(tmp_path):
+    rng = np.random.default_rng(1)
+    tex = Image.fromarray(rng.integers(0, 256, (70, 90), dtype=np.uint8))
+    dual = Image.new("L", (40, 20), 0)
+    dual.paste(200, (5, 5, 35, 15))
+    b = Brush(name="纹理双重", tips=[dual.copy()], texture=Texture(image=tex, scale=0.5, depth=0.6, mode="subtract"),
+              dual=DualTip(image=dual, size_px=12, spacing=0.3, mode="multiply"))
+    f = CspCodec().write([b], tmp_path / "td.sut")[0]
+    r = CspCodec().read(f)[0]
+    assert r.texture is not None and r.texture.mode == "subtract"
+    assert np.array_equal(np.asarray(r.texture.image.convert("L")), np.asarray(tex))
+    assert r.dual is not None and np.array_equal(np.asarray(r.dual.image.convert("L")), np.asarray(dual))
+    v = _variant(f)
+    assert v["UseDualBrush"] == 1 and v["DualAutoIntervalType"] == 0
 
 
 def test_downgrade_fix(tmp_path):

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PIL import Image
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSplitter, QTableWidget,
@@ -23,12 +23,20 @@ from ..core.convert import DetectedApp, OpenedFile
 from ..core.model import BrushRef
 from ..core.plugin import FileInfo, codecs, load_plugins
 from ..core.system import export_dir, open_in_explorer
+from .brush_grid import THUMB, BrushGridView, BrushListModel, PixmapCache, ThumbnailLoader, pil_to_qimage
 
 log = logging.getLogger(__name__)
 
-THUMB = 96
-ROLE_REF = Qt.UserRole + 1
 ROLE_SRC = Qt.UserRole + 2
+
+# Friendlier names for export targets (codec names come from the format plugins).
+CODEC_LABELS = {
+    "csp": "Clip Studio Paint 笔刷 (.sut)",
+}
+
+
+def codec_label(c) -> str:
+    return CODEC_LABELS.get(c.id, c.name)
 
 STYLE = """
 QWidget { font-size: 13px; }
@@ -38,9 +46,7 @@ QTabBar::tab:selected { font-weight: bold; }
 QListWidget#sources { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 4px; }
 QListWidget#sources::item { padding: 7px 6px; border-radius: 4px; }
 QListWidget#sources::item:selected { background: #2f6fed; color: white; }
-QListWidget#grid { background: white; border: 1px solid #ddd; border-radius: 6px; }
-QListWidget#grid::item { border-radius: 6px; padding: 4px; }
-QListWidget#grid::item:selected { background: #dce7fd; color: black; }
+QListView#grid { background: white; border: 1px solid #ddd; border-radius: 6px; }
 QPushButton { padding: 6px 14px; border-radius: 5px; border: 1px solid #c8c8d0; background: white; }
 QPushButton:hover { background: #eef2fb; }
 QPushButton#primary { background: #2f6fed; color: white; border: none; font-size: 15px; font-weight: bold; padding: 10px 26px; }
@@ -68,12 +74,15 @@ class _Job(QRunnable):
 
     def run(self):
         try:
-            res = self.fn()
-        except Exception as e:
-            log.exception("background job failed")
-            self.signals.failed.emit(f"{e}\n\n{traceback.format_exc(limit=3)}")
-        else:
-            self.signals.done.emit(res)
+            try:
+                res = self.fn()
+            except Exception as e:
+                log.exception("background job failed")
+                self.signals.failed.emit(f"{e}\n\n{traceback.format_exc(limit=3)}")
+            else:
+                self.signals.done.emit(res)
+        except RuntimeError:  # receiver already gone (app shutting down)
+            log.debug("background job finished after shutdown")
 
 
 _jobs: set = set()
@@ -97,29 +106,8 @@ def run_bg(fn: Callable[[], Any], on_done: Callable[[Any], None], on_fail: Optio
 # helpers
 # ---------------------------------------------------------------------------------------------
 def pil_to_pixmap(img: Image.Image, size: int = THUMB) -> QPixmap:
-    if img.mode == "L":  # tip mask: 255 = paint → show dark paint on white
-        from PIL import ImageOps
-
-        a = ImageOps.autocontrast(img, cutoff=0.5) if img.getextrema()[1] < 250 else img
-        img = Image.new("RGBA", a.size, (30, 30, 36, 0))
-        img.putalpha(a)
-    img = img.convert("RGBA")
-    img.thumbnail((size - 8, size - 8), Image.LANCZOS)
-    bg = Image.new("RGBA", (size, size), (255, 255, 255, 255))
-    bg.alpha_composite(img, ((size - img.width) // 2, (size - img.height) // 2))
-    data = bg.tobytes("raw", "RGBA")
-    qimg = QImage(data, size, size, QImage.Format_RGBA8888).copy()
-    return QPixmap.fromImage(qimg)
-
-
-def placeholder_pixmap(size: int = THUMB) -> QPixmap:
-    pm = QPixmap(size, size)
-    pm.fill(QColor("white"))
-    p = QPainter(pm)
-    p.setPen(QColor("#bbb"))
-    p.drawText(pm.rect(), Qt.AlignCenter, "…")
-    p.end()
-    return pm
+    """GUI thread only; workers use ``pil_to_qimage``."""
+    return QPixmap.fromImage(pil_to_qimage(img, size))
 
 
 def result_dialog(parent, ok: bool, message: str, files: list[Path]):
@@ -147,9 +135,11 @@ class TransferPage(QWidget):
         self.win = win
         self.detected: list[DetectedApp] = []
         self.files: list[OpenedFile] = []
-        self.refs: list[BrushRef] = []
         self.source_token = 0
-        self.thumb_cache: dict[tuple, QPixmap] = {}
+        self.thumb_loader = ThumbnailLoader(pil_to_qimage, max_threads=2, parent=self)
+        self.thumb_cache = PixmapCache(2000)
+        self.model = BrushListModel(self.thumb_loader, self.thumb_cache, self)
+        self.model.checkedChanged.connect(self._update_count)
 
         root = QHBoxLayout(self)
         split = QSplitter(Qt.Horizontal)
@@ -193,28 +183,21 @@ class TransferPage(QWidget):
         head.addWidget(self.group)
         rv.addLayout(head)
 
-        self.grid = QListWidget()
+        self.grid = BrushGridView(self.model, parent=self)
         self.grid.setObjectName("grid")
-        self.grid.setViewMode(QListWidget.IconMode)
-        self.grid.setIconSize(QSize(THUMB, THUMB))
-        self.grid.setGridSize(QSize(THUMB + 34, THUMB + 46))
-        self.grid.setResizeMode(QListWidget.Adjust)
-        self.grid.setMovement(QListWidget.Static)
-        self.grid.setWordWrap(True)
-        self.grid.setUniformItemSizes(True)
-        self.grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.grid.itemChanged.connect(self._update_count)
-        self.grid.itemDoubleClicked.connect(self._toggle)
-        self.grid.verticalScrollBar().valueChanged.connect(lambda *_: self._thumb_timer.start(80))
+        self.grid.checkAllRequested.connect(lambda: self._check_all(True))
+        self.proxy = self.grid.proxy
         rv.addWidget(self.grid, 1)
         self.status = QLabel("")
         self.status.setObjectName("hint")
         rv.addWidget(self.status)
 
         sel = QHBoxLayout()
-        for text, fn in (("全选", lambda: self._check_all(True)), ("全不选", lambda: self._check_all(False)),
-                         ("勾选高亮项", self._check_selected)):
+        for text, fn, tip in (("全选", lambda: self._check_all(True), "勾选当前显示的全部笔刷"),
+                              ("全不选", lambda: self._check_all(False), "取消勾选当前显示的全部笔刷"),
+                              ("反选", self._invert, "把当前显示的笔刷勾选状态反过来")):
             b = QPushButton(text)
+            b.setToolTip(tip)
             b.clicked.connect(fn)
             sel.addWidget(b)
         sel.addStretch(1)
@@ -240,11 +223,6 @@ class TransferPage(QWidget):
         rv.addLayout(tgt)
         split.addWidget(right)
         split.setSizes([260, 900])
-
-        self._thumb_timer = QTimer(self)
-        self._thumb_timer.setSingleShot(True)
-        self._thumb_timer.timeout.connect(self._load_visible_thumbs)
-        self._thumbs_pending: set[int] = set()
 
     # sources ---------------------------------------------------------------------------------
     def set_detected(self, detected: list[DetectedApp]):
@@ -290,7 +268,18 @@ class TransferPage(QWidget):
                 self.sources.setCurrentRow(i)
                 return
 
+    @staticmethod
+    def _target_key(data) -> Optional[tuple]:
+        if not data:
+            return None
+        kind, obj = data
+        if kind == "codec":
+            return kind, obj.id
+        return kind, obj.adapter.id, obj.label
+
     def _rebuild_targets(self):
+        prev = self._target_key(self.target.currentData())
+        self.target.blockSignals(True)
         self.target.clear()
         for d in self.detected:
             if not d.adapter.desktop:
@@ -300,11 +289,15 @@ class TransferPage(QWidget):
                 self.target.addItem(f"→ {d.install.label}（实验：直接写入，需先关闭 CSP，会自动备份）", ("app_direct", d))
             elif d.install is not None:
                 self.target.addItem(f"→ {d.install.label}（自动导入）", ("app", d))
-            elif not d.adapter.desktop:
-                self.target.addItem(f"→ {d.adapter.name}（生成文件，发到 iPad 上打开）", ("app", d))
         for c in codecs():
             if c.can_write:
-                self.target.addItem(f"💾 导出为文件：{c.name}", ("codec", c))
+                self.target.addItem(f"💾 导出为文件：{codec_label(c)}", ("codec", c))
+        if prev is not None:  # keep the artist's choice across re-detection (e.g. after a transfer)
+            for i in range(self.target.count()):
+                if self._target_key(self.target.itemData(i)) == prev:
+                    self.target.setCurrentIndex(i)
+                    break
+        self.target.blockSignals(False)
 
     def add_files(self, paths: list[Path]):
         paths = convert.expand_paths(paths)
@@ -345,8 +338,7 @@ class TransferPage(QWidget):
         kind, obj = cur.data(ROLE_SRC)
         self.source_token += 1
         token = self.source_token
-        self.grid.clear()
-        self.refs = []
+        self.model.set_refs([], None)
         self.title.setText(f"② 勾选要搬运的笔刷 — {cur.text()}")
         self.status.setText("正在读取笔刷列表…")
 
@@ -362,19 +354,28 @@ class TransferPage(QWidget):
 
         run_bg(work, done, lambda m: self.status.setText("读取失败：" + m.splitlines()[0]))
 
+    @property
+    def refs(self) -> list[BrushRef]:
+        return self.model.refs
+
+    @staticmethod
+    def _source_ns(kind: str, obj) -> tuple:
+        """Stable identity of a brush source, so thumbnails stay cached when switching back."""
+        if kind == "app" and obj is not None:
+            inst = obj.install
+            return ("app", obj.adapter.id, inst.label if inst else "", str(inst.data_dir) if inst else "")
+        if kind == "file" and obj is not None:
+            try:
+                mtime = obj.path.stat().st_mtime_ns
+            except OSError:
+                mtime = 0
+            return ("file", str(obj.path), mtime)
+        return ("other", id(obj))
+
     def _show_refs(self, refs: list[BrushRef], kind: str, obj):
-        self.refs = refs
-        self.grid.blockSignals(True)
-        self.grid.clear()
-        ph = QIcon(placeholder_pixmap())
-        for i, r in enumerate(refs):
-            it = QListWidgetItem(ph, r.name)
-            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Unchecked)
-            it.setData(ROLE_REF, i)
-            it.setToolTip("\n".join(x for x in (r.name, r.group, r.detail) if x))
-            self.grid.addItem(it)
-        self.grid.blockSignals(False)
+        ns = self._source_ns(kind, obj) if obj is not None else None
+        self.model.set_refs(refs, ns)
+        log.info("showing %d brushes from %s", len(refs), ns)
         groups = sorted({r.group for r in refs if r.group})
         self.group.blockSignals(True)
         self.group.clear()
@@ -383,97 +384,35 @@ class TransferPage(QWidget):
             self.group.addItem(g, g)
         self.group.setVisible(bool(groups))
         self.group.blockSignals(False)
-        if not refs:
-            msg = "没有找到笔刷。"
-            if kind == "app" and obj.adapter.id == "procreate":
-                msg = "Procreate 只在 iPad 上运行：请在 iPad 上分享笔刷，把 .brushset / .brush 文件传到电脑后拖进来。"
-            self.status.setText(msg)
-        else:
-            self.status.setText(f"共 {len(refs)} 个笔刷。点击方框勾选，双击切换勾选。")
+        self.empty_msg = "没有找到笔刷。"
+        if not refs and kind == "app" and obj is not None and obj.adapter.id == "procreate":
+            self.empty_msg = "Procreate 只在 iPad 上运行：请在 iPad 上分享笔刷，把 .brushset / .brush 文件传到电脑后拖进来。"
         self._update_count()
         self._filter()
-        self._thumb_timer.start(50)
-
-    # thumbnails ------------------------------------------------------------------------------
-    def _load_visible_thumbs(self):
-        if not self.refs:
-            return
-        token = self.source_token
-        vp = self.grid.viewport().rect()
-        todo = []
-        for row in range(self.grid.count()):
-            it = self.grid.item(row)
-            if it.isHidden():
-                continue
-            if self.grid.visualItemRect(it).intersects(vp.adjusted(0, -200, 0, 400)):
-                i = it.data(ROLE_REF)
-                key = (token, i)
-                if key in self.thumb_cache:
-                    it.setIcon(QIcon(self.thumb_cache[key]))
-                elif i not in self._thumbs_pending:
-                    todo.append((row, i))
-        if not todo:
-            return
-        refs = self.refs
-        for row, i in todo:
-            self._thumbs_pending.add(i)
-
-            def work(i=i):
-                r = refs[i]
-                img = r.thumbnail() if r.thumbnail else None
-                return i, img
-
-            def done(res, token=token):
-                i, img = res
-                self._thumbs_pending.discard(i)
-                if token != self.source_token or img is None:
-                    return
-                pm = pil_to_pixmap(img)
-                self.thumb_cache[(token, i)] = pm
-                for row in range(self.grid.count()):
-                    it = self.grid.item(row)
-                    if it.data(ROLE_REF) == i:
-                        it.setIcon(QIcon(pm))
-                        break
-
-            run_bg(work, done, lambda m, i=i: self._thumbs_pending.discard(i))
+        self.grid.scrollToTop()
 
     # selection -------------------------------------------------------------------------------
     def _filter(self, *_):
-        text = self.search.text().strip().lower()
-        grp = self.group.currentData()
-        for row in range(self.grid.count()):
-            it = self.grid.item(row)
-            r = self.refs[it.data(ROLE_REF)] if self.refs else None
-            visible = r is not None and (not text or text in r.name.lower()) and (grp is None or r.group == grp)
-            it.setHidden(not visible)
-        self._thumb_timer.start(50)
-
-    def _toggle(self, it: QListWidgetItem):
-        it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+        self.proxy.set_filter(self.search.text(), self.group.currentData())
+        total, shown = len(self.refs), self.proxy.rowCount()
+        if not total:
+            self.status.setText(getattr(self, "empty_msg", "没有找到笔刷。"))
+        else:
+            head = f"共 {total} 个笔刷" + (f"，当前显示 {shown} 个" if shown != total else "")
+            self.status.setText(f"{head}。单击笔刷即可勾选 / 取消，按住 Shift 单击可连续勾选一串。")
+        self.grid.schedule_visible()
 
     def _check_all(self, on: bool):
-        self.grid.blockSignals(True)
-        for row in range(self.grid.count()):
-            it = self.grid.item(row)
-            if not it.isHidden():
-                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
-        self.grid.blockSignals(False)
-        self._update_count()
+        self.model.set_checked(self.proxy.source_rows(), on)
 
-    def _check_selected(self):
-        self.grid.blockSignals(True)
-        for it in self.grid.selectedItems():
-            it.setCheckState(Qt.Checked)
-        self.grid.blockSignals(False)
-        self._update_count()
+    def _invert(self):
+        self.model.invert(self.proxy.source_rows())
 
     def checked_refs(self) -> list[BrushRef]:
-        return [self.refs[self.grid.item(r).data(ROLE_REF)] for r in range(self.grid.count())
-                if self.grid.item(r).checkState() == Qt.Checked]
+        return self.model.checked_refs()
 
     def _update_count(self, *_):
-        n = len(self.checked_refs()) if self.refs else 0
+        n = len(self.model.checked)
         self.count.setText(f"已选 {n} 个")
         self.go.setText(f"开始导入（{n}）" if n else "开始导入")
 
@@ -490,7 +429,7 @@ class TransferPage(QWidget):
         if kind == "codec":
             ext = obj.extensions[0] if obj.extensions else ""
             default = export_dir("导出") / (refs[0].name if len(refs) == 1 else f"BrushBridge_{len(refs)}笔刷")
-            path, _ = QFileDialog.getSaveFileName(self, "导出为", str(default) + ext, f"{obj.name} (*{ext})")
+            path, _ = QFileDialog.getSaveFileName(self, "导出为", str(default) + ext, f"{codec_label(obj)} (*{ext})")
             if not path:
                 return
             self._run_transfer(refs, lambda brushes: self._export(obj, brushes, Path(path)))
@@ -756,6 +695,10 @@ class MainWindow(QMainWindow):
 
         run_bg(convert.detect_all, done)
 
+    def closeEvent(self, e):
+        self.transfer.thumb_loader.shutdown()  # don't make the app wait for queued thumbnails
+        super().closeEvent(e)
+
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
@@ -781,6 +724,9 @@ def _setup_logging():
 
 def main(argv: Optional[list[str]] = None) -> int:
     _setup_logging()
+    # Brush decoders used for thumbnails are mostly pure Python and run on worker threads; a short
+    # GIL switch interval keeps painting/scrolling responsive while they work (default is 5 ms).
+    sys.setswitchinterval(0.0005)
     argv = sys.argv if argv is None else argv
     app = QApplication(argv)
     app.setApplicationName("Brush Bridge")

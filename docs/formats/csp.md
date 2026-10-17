@@ -177,15 +177,53 @@ catalog.zip, info.zip, data/material_0.layer, thumbnail/thumbnail.png, icedata/l
   * The `.layer` inside is a full `.clip`-style canvas database (about 56 `ParamScheme` tables,
     `Offscreen` block data, …).
   * The first chunk is **encrypted**.
-* brush-bridge does **not** try to decrypt or generate it. As a result:
-  * **Reading:** tips and textures come from `thumbnail.png`. It is black ink on transparency and at
-    most about 300 px. Tip mask = `alpha × (255 − luminance)`; textures are composited over white.
-    The material's real resolution can be higher than the thumbnail.
+* brush-bridge does **not** decrypt CSP's own materials, but it **can generate new ones**
+  (`brush_bridge/formats/csp_material.py`). See "Generating materials" below. As a result:
+  * **Reading:** materials written by brush-bridge (plain chunks) are decoded at full resolution.
+    For CSP's own (encrypted) materials, tips and textures come from `thumbnail.png`. It is black ink
+    on transparency and at most about 300 px. Tip mask = `alpha × (255 − luminance)`; textures are
+    composited over white.
   * **Writing:** for brushes that came from CSP, the archives are copied verbatim (from the .sut, or
     packed from the user's library). Bundled materials without `data` are referenced only and are
-    not embedded. Brushes from other apps that have custom tips or textures get a round tip in the
-    `.sut`, plus a warning. The adapter also exports an ABR v6.2 file, which CSP imports with the
-    real tip shape.
+    not embedded. Custom tips, textures and dual tips from other apps are written as newly generated
+    materials embedded in the `.sut`. The adapter still exports an ABR v6.2 file as a fallback.
+
+## Generating materials
+
+These findings come from decoding every blob of four real materials (two brush tips and two paper
+textures). The builder reproduces CSP's own `Offscreen` attribute, empty and pixel `BlockData`, and
+`ResizableImageInfo` **byte-for-byte**. Generated materials have not yet been confirmed inside CSP.
+
+* **C2F chunks**
+  * Each chunk is u32 LE length, 4-byte tag, payload, then CRC32 LE over tag + payload.
+  * `HEAD` and `TAIL` are empty.
+  * A `dATA` payload starts with a 2-byte flag: `01 00` = encrypted (8 extra bytes), `00 00` = plain.
+  * CSP writes the first 5120 database bytes encrypted and the rest plain.
+  * brush-bridge writes all chunks plain, as either the same split or a single chunk.
+  * `catalog.zip` / `info.zip` are C2F around a real zip holding `catalog.xml` / `info.xml`.
+* **`material_0.layer`**
+  * SQLite with a 4096-byte page size.
+  * The schema plus `ParamScheme` / `ElemScheme` rows are shipped in `csp_material_template.json`.
+  * `Canvas` holds W/H. `CanvasPreview` is a transparent RGBA PNG.
+  * There are three `Offscreen` rows: a 5-channel empty, a 1-channel empty, and a 1-channel pixel layer.
+* **Offscreen `Attribute`**
+  * Sections are `Parameter` `[W, H, blocksX, blocksY, …]`, `InitColor`, and `BlockSize`.
+  * Names are UTF-16BE; words are BE u32.
+* **`BlockData`**
+  * The image is split into 256×256 tiles.
+  * Each tile is a `BlockDataBeginChunk` record: idx, raw size, 256, 256, an exists flag, then
+    `u32 BE len+4` + `u32 LE len` + zlib data, closed by `BlockDataEndChunk`.
+  * After the tiles come `BlockStatus` and `BlockCheckSum` (Adler-32 of the LE length + zlib bytes).
+* **Pixels** are ink density, where 255 = paint.
+  * CSP stores 255 − grey of an imported image.
+  * Tips are written from the neutral mask directly. Textures are written as 255 − L.
+* **Material type**
+  * `layerData.xml` and `ResizableImageInfo` (u32 pair at offset 16) select the type.
+  * (0, 0) = `BrushPattern` (画像素材:ブラシ).
+  * (1, 3) = `PaperTexture` (単色パターン:テクスチャ).
+* **References**
+  * `OriginalPath` = `.:NN:NN:<uuid>:data:material_0.layer`, and the reference kind is 2.
+  * CSP renumbers the `NN` folders on import.
 
 ## Parameter mapping (Variant → neutral `Brush`)
 
@@ -198,14 +236,14 @@ catalog.zip, info.zip, data/material_0.layer, thumbnail/thumbnail.png, icedata/l
 | `BrushHardness` | `hardness` | |
 | `BrushInterval`, `BrushAutoIntervalType` | `spacing` | type 0 = fixed %; 1/2/3 = automatic presets, approximated as 5/10/25 % |
 | `BrushThickness`, `BrushVerticalThicknes` | `roundness`, `angle` (+90°) | |
-| `BrushRotation`, `BrushRotationEffector`, `BrushRotationRandomScale` | `angle`, `angle_follow_stroke`, `angle_jitter` | |
+| `BrushRotation`, `BrushRotationEffector`, `BrushRotationRandomScale` (+ `…InSpray` when spray is on) | `angle`, `angle_follow_stroke`, `angle_jitter` | |
 | `BrushThicknessEffector` (random) | `roundness_jitter` | |
-| `BrushUsePatternImage`, `BrushPatternImageArray` | `tips` | material thumbnails |
+| `BrushUsePatternImage`, `BrushPatternImageArray` | `tips` | full resolution for generated materials, thumbnails otherwise |
 | `BrushPatternOrderType` | `tip_order` | 3 = random **(inferred)** |
 | `BrushPatternReverseHorizontal/Vertical` | `flip_x/flip_y` | |
 | `BrushUseSpray`, `BrushSpraySize(+Unit, SyncBrushSize)`, `BrushSprayDensity(+Effector)` | `scatter`, `scatter_both_axes`, `count`, `count_jitter` | scatter = spray diameter ÷ brush size |
 | `BrushUseIn/Out`, `BrushIn/OutLength(+Unit)`, `BrushInOutType` | `taper_start/end` | length px ÷ 100 (type 1 = %) |
-| `TextureImage`, `TextureScale2`, `TextureDensity(+Effector)`, `TextureReverseDensity`, `TextureBrightness`, `TextureContrast`, `TextureForPlot` | `texture` | |
+| `TextureImage`, `TextureCompositeMode`, `TextureScale2`, `TextureDensity(+Effector)`, `TextureReverseDensity`, `TextureBrightness`, `TextureContrast`, `TextureForPlot` | `texture` | composite mode 0 = multiply, 1 = subtract **(inferred)** |
 | `UseDualBrush`, `Dual*` | `dual` | |
 | `BrushChangePatternColor` / `BrushChangeStrokeColor` + `Brush[Stroke]Hue/Saturation/Value/SubColor…` | `color` | hue range 0–180 → 0–1 |
 | `BrushUseWaterColor`, `BrushMixColor`, `BrushMixAlpha`, `BrushMixColorExtension` | `wet` | load = paint amount, wetness = 1 − paint density |

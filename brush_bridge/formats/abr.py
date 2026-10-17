@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import mmap
 import struct
+import threading
 import uuid as _uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1049,10 +1050,37 @@ def _native_only(af: AbrFile, idx: int) -> Brush:
 # ---------------------------------------------------------------------------------------------
 
 
+_CACHE: dict[tuple, AbrFile] = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_TIMER: Optional[threading.Timer] = None
+
+
+def _close_cache() -> None:
+    with _CACHE_LOCK:
+        for af in _CACHE.values():
+            af.close()
+        _CACHE.clear()
+
+
 def _thumb(af_path: Path, idx: int):
+    """Thumbnail loader. Parsed files are shared between thumbnails of the same library (parsing a
+    large Brushes.psp dominates), and closed again after a short idle period so the file isn't
+    kept locked while Photoshop wants to write it."""
     def f():
-        af = parse(af_path)
-        try:
+        global _CACHE_TIMER
+        with _CACHE_LOCK:
+            st = Path(af_path).stat()
+            key = (str(af_path), st.st_mtime_ns, st.st_size)
+            af = _CACHE.get(key)
+            if af is None:
+                for k in [k for k in _CACHE if k[0] == key[0] or len(_CACHE) >= 4]:
+                    _CACHE.pop(k).close()
+                af = _CACHE[key] = parse(af_path)
+            if _CACHE_TIMER is not None:
+                _CACHE_TIMER.cancel()
+            _CACHE_TIMER = threading.Timer(3.0, _close_cache)
+            _CACHE_TIMER.daemon = True
+            _CACHE_TIMER.start()
             if af.legacy:
                 return af.legacy[idx].main_tip()
             p = af.presets[idx][0]
@@ -1064,8 +1092,6 @@ def _thumb(af_path: Path, idx: int):
                 t = p.sub("Brsh")
                 img = round_tip(64, t.num("Hrdn", 100) / 100, t.num("Rndn", 100) / 100, t.num("Angl", 0))
             return img
-        finally:
-            af.close()
 
     return f
 

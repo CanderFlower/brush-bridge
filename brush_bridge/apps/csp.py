@@ -174,8 +174,8 @@ class CspAdapter(AppAdapter):
             abr = out / f"{safe_filename(lossy[0].name if len(lossy) == 1 else 'BrushBridge')}_{stamp}.abr"
             try:
                 files += codec("abr").write(lossy, abr)
-                msg += (f"\n\n其中 {len(lossy)} 个笔刷带有自定义笔尖/纹理，.sut 无法保存这些图像，"
-                        f"所以另外导出了 {abr.name}：把它同样拖进「子工具」面板即可保留笔尖形状。")
+                msg += (f"\n\n其中 {len(lossy)} 个笔刷的笔尖/纹理是新生成的 CSP 素材（已内嵌在 .sut 中）。"
+                        f"万一你的 CSP 版本无法读取，可改为把备用文件 {abr.name} 拖进「子工具」面板。")
             except Exception as e:  # noqa: BLE001 - the .sut files are still usable
                 msg += f"\n\n（额外导出 .abr 失败：{e}）"
         notes = sorted({n for b in brushes for n in b.notes})

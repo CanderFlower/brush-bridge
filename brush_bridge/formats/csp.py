@@ -1,16 +1,17 @@
 """Clip Studio Paint sub tool (.sut) codec.
 
 A .sut is a SQLite database holding exactly one exported sub tool (see ``docs/formats/csp.md``).
-Brush tip / texture materials are embedded in ``MaterialFile`` as tar archives whose ``.layer``
-payload is encrypted by CELSYS; we read their (plain PNG) thumbnails and copy the archives
-verbatim on round trips, but cannot create new materials. Brushes with custom tips coming from
-other apps are therefore written with a round tip (plus a Chinese warning) - the CSP adapter
-additionally exports an .abr file that CSP can import with the real tip shape.
+Brush tip / texture materials are embedded in ``MaterialFile`` as tar archives. Materials made
+by CSP have their ``.layer`` partly encrypted; we read their (plain PNG) thumbnails and copy the
+archives verbatim on round trips. Custom tips / textures / dual tips coming from other apps are
+written as newly generated (unencrypted) materials by :mod:`.csp_material`, at full resolution.
 """
 from __future__ import annotations
 
 import hashlib
 import sqlite3
+import struct
+import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -21,8 +22,9 @@ from ..core.plugin import FileInfo, FormatCodec, Fix, register_codec
 from ..core.system import safe_filename, unique_path
 from . import csp_schema as S
 from .csp_binary import (EFF_PRESSURE, EFF_RANDOM, EFF_TILT, EFF_VELOCITY, ROT_BASE, ROT_DIRECTION, ROT_RANDOM,
-                         MaterialRef, decode_effector, decode_material_refs, encode_effector, material_thumbnail,
-                         thumbnail_to_texture, thumbnail_to_tip)
+                         MaterialRef, decode_effector, decode_material_refs, encode_effector, encode_material_refs,
+                         material_members, material_thumbnail, thumbnail_to_texture, thumbnail_to_tip)
+from .csp_material import KIND_TEXTURE, KIND_TIP, build_material, read_material_ink
 
 # Variant.CompositeMode (same order as CSP's blending-mode list); 27 = transparent colour/eraser.
 COMPOSITE_TO_BLEND = {
@@ -35,6 +37,11 @@ COMPOSITE_TO_BLEND = {
 BLEND_TO_COMPOSITE = {v: k for k, v in COMPOSITE_TO_BLEND.items() if k not in (9, 11)}
 BLEND_TO_COMPOSITE.update({"luminosity": 0, "behind": 0, "linear_dodge": 10})
 COMPOSITE_ERASER = 27
+# TextureCompositeMode / DualTextureCompositeMode: 0 multiply, 1 subtract (inferred from the UI order).
+TEXTURE_MODES = {0: "multiply", 1: "subtract"}
+TEXTURE_MODE_IDS = {v: k for k, v in TEXTURE_MODES.items()}
+# DualBrushCompositeMode uses the CompositeMode list.
+MAX_GENERATED_TIPS = 16
 
 # Length units used by BrushSizeUnit / BrushInLengthUnit / ...: 0 px, 1 cm, 2 mm, 3 inch, 4 pt.
 # Physical units are converted at 350 dpi (CSP's default canvas resolution for illustrations).
@@ -149,6 +156,10 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
         b.scatter_both_axes = True
         b.count = max(1, int(_num(v.get("BrushSprayDensity"), 1)))
         b.count_jitter = _dyn(v.get("BrushSprayDensityEffector")).jitter
+        srot = int(v.get("BrushRotationEffectorInSpray") or ROT_BASE)
+        if srot & ROT_RANDOM:
+            b.angle_jitter = _clamp(_num(v.get("BrushRotationRandomInSpray"), 100) / 100)
+        b.angle_follow_stroke = b.angle_follow_stroke or bool(srot & ROT_DIRECTION)
 
     # Taper ("入り抜き"); neutral unit = fraction of a 100 px stroke
     in_pct = int(v.get("BrushInOutType") or 0) == 1
@@ -168,6 +179,7 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
                 scale=max(0.01, _num(v.get("TextureScale2"), 100) / 100),
                 depth=_clamp(_num(v.get("TextureDensity"), 50) / 100),
                 invert=bool(v.get("TextureReverseDensity")),
+                mode=TEXTURE_MODES.get(int(v.get("TextureCompositeMode") or 0), "multiply"),
                 brightness=_clamp(_num(v.get("TextureBrightness")) / 100, -1),
                 contrast=_clamp(_num(v.get("TextureContrast")) / 100, -1),
                 per_tip=bool(v.get("TextureForPlot")),
@@ -252,6 +264,10 @@ def brush_columns(b: Brush) -> dict[str, object]:
         "BrushSpraySizeSyncBrushSize": 0,
         "BrushSprayDensity": max(1, int(b.count)),
         "BrushSprayDensityEffector": encode_effector(jitter=b.count_jitter),
+        # with spray on, CSP rotates particles using the *InSpray fields
+        "BrushRotationInSpray": round(float(b.angle) % 360, 2),
+        "BrushRotationEffectorInSpray": rot,
+        "BrushRotationRandomInSpray": int(round(_clamp(b.angle_jitter) * 100)) if b.angle_jitter > 0 else 100,
         "BrushInOutType": 0,
         "BrushUseIn": int(b.taper_start > 0),
         "BrushInLength": round(b.taper_start * 100, 2) if b.taper_start > 0 else 20.0,
@@ -279,7 +295,17 @@ def brush_columns(b: Brush) -> dict[str, object]:
         c.update({"TextureScale2": round(t.scale * 100, 2), "TextureDensity": int(round(_clamp(t.depth) * 100)),
                   "TextureReverseDensity": int(t.invert), "TextureBrightness": int(round(t.brightness * 100)),
                   "TextureContrast": int(round(t.contrast * 100)), "TextureForPlot": int(t.per_tip),
+                  "TextureCompositeMode": TEXTURE_MODE_IDS.get(t.mode, 0),
                   "TextureDensityEffector": _enc(t.depth_dynamic)})
+    d = b.dual
+    if d is not None:
+        dspray = d.scatter > 0 or d.count > 1
+        c.update({"DualBrushCompositeMode": BLEND_TO_COMPOSITE.get(d.mode, 2), "SyncDualBrushSize": 0,
+                  "DualSize": round(max(1.0, d.size_px), 2), "DualSizeUnit": 0,
+                  "DualInterval": round(max(0.01, d.spacing) * 100, 2), "DualAutoIntervalType": 0,
+                  "DualUseSpray": int(dspray), "DualSprayDensity": max(1, int(d.count)),
+                  "DualSpraySize": round(max(d.scatter, 0.01) * d.size_px, 2) if dspray else 2.0,
+                  "DualSpraySizeUnit": 0, "DualSpraySizeSyncBrushSize": 0})
     return c
 
 
@@ -293,7 +319,7 @@ def _fingerprint(b: Brush) -> dict[str, object]:
 
 
 def loses_images(b: Brush) -> bool:
-    """True when writing ``b`` as .sut drops a tip / texture / dual tip image (no native material)."""
+    """True when writing ``b`` as .sut needs newly generated tip / texture / dual-tip materials."""
     nat = (b.source.native or {}).get("csp") if b.source else None
     old = (nat or {}).get("fingerprint") or {}
     new = _fingerprint(b)
@@ -305,6 +331,23 @@ def loses_images(b: Brush) -> bool:
 # ---------------------------------------------------------------------------------------------
 # Codec
 # ---------------------------------------------------------------------------------------------
+def _embedded_image(file_data: bytes) -> Optional[Image.Image]:
+    """Full-resolution pixels for unencrypted materials, else the material thumbnail.
+
+    Returned as black ink on transparency, like CSP thumbnails.
+    """
+    layer = next((v for k, v in material_members(file_data).items() if k.endswith(".layer")), None)
+    try:
+        ink = read_material_ink(layer) if layer else None
+    except (sqlite3.Error, struct.error, zlib.error, ValueError):
+        ink = None
+    if ink is not None:
+        im = Image.new("RGBA", (ink.shape[1], ink.shape[0]), (0, 0, 0, 0))
+        im.putalpha(Image.fromarray(ink))
+        return im
+    return material_thumbnail(file_data)
+
+
 def _material_resolver(rows: list[dict]) -> ImageResolver:
     """Embedded MaterialFile rows first, then the local CSP material library (bundled materials)."""
     cache: dict[str, Optional[Image.Image]] = {}
@@ -317,7 +360,7 @@ def _material_resolver(rows: list[dict]) -> ImageResolver:
         uid = next((p for p in reversed(ref.path.split(":")) if len(p) >= 32), "")
         for r in rows:
             if r.get("OriginalPath") == ref.path or (uid and uid in (r.get("OriginalPath") or "")):
-                im = material_thumbnail(r.get("FileData") or b"")
+                im = _embedded_image(r.get("FileData") or b"")
                 break
         if im is None:
             try:
@@ -502,27 +545,42 @@ def build_variant(b: Brush) -> tuple[dict, list[tuple[str, str]], list[dict], di
     if fp_old and fp_old.get("__eraser") and not b.is_eraser and row.get("CompositeMode") == COMPOSITE_ERASER:
         row["CompositeMode"] = BLEND_TO_COMPOSITE.get(b.blend_mode, 0)
 
-    # Materials we can't create: drop references whose image changed / never existed natively
+    # Images without a native CSP material: generate new (unencrypted) materials
+    generated: list[dict] = []
+
+    def gen(images: list[Image.Image], kind: str, label: str) -> bytes:
+        refs = []
+        for i, im in enumerate(images):
+            name = f"{b.name} {label}" + (f" {i + 1}" if len(images) > 1 else "")
+            m = build_material(im, name, kind)
+            refs.append(m.ref())
+            generated.append(m.material_row())
+        return encode_material_refs(refs)
+
     if fp_old.get("__tips", "") != fp_new["__tips"]:
-        row["BrushUsePatternImage"] = 0
-        row["BrushPatternImageArray"] = None
         if b.tips:
-            b.warn("Clip Studio Paint 的笔尖素材是加密格式，无法写入自定义笔尖形状，.sut 中已改用圆形笔尖"
-                   "（可改为导入同时导出的 .abr 文件以保留笔尖形状）。")
+            if len(b.tips) > MAX_GENERATED_TIPS:
+                b.warn(f"笔尖图像超过 {MAX_GENERATED_TIPS} 个，只保留前 {MAX_GENERATED_TIPS} 个。")
+            row["BrushUsePatternImage"] = 1
+            row["BrushPatternImageArray"] = gen(b.tips[:MAX_GENERATED_TIPS], KIND_TIP, "笔尖")
+        else:
+            row["BrushUsePatternImage"] = 0
+            row["BrushPatternImageArray"] = None
     if fp_old.get("__texture", "") != fp_new["__texture"]:
-        row["TextureImage"] = None
-        if b.texture is not None:
-            b.warn("Clip Studio Paint 的纹理素材无法由本工具生成，.sut 中已去掉纹理。")
+        row["TextureImage"] = gen([b.texture.image], KIND_TEXTURE, "纹理") if b.texture is not None else None
     if fp_old.get("__dual", "") != fp_new["__dual"]:
-        row["UseDualBrush"] = 0
-        row["DualPatternImageArray"] = None
         if b.dual is not None:
-            b.warn("Clip Studio Paint 的双重笔刷素材无法由本工具生成，.sut 中已去掉双重笔刷。")
+            row["UseDualBrush"] = 1
+            row["DualUsePatternImage"] = 1
+            row["DualPatternImageArray"] = gen([b.dual.image], KIND_TIP, "双重笔尖")
+        else:
+            row["UseDualBrush"] = 0
+            row["DualPatternImageArray"] = None
     used = set()
     for col in ("BrushPatternImageArray", "TextureImage", "DualPatternImageArray", "DualTextureImage"):
         for r in decode_material_refs(row.get(col)):
             used.add(r.path)
-    mats = [m for m in mats if m.get("OriginalPath") in used]
+    mats = [m for m in mats if m.get("OriginalPath") in used] + generated
     return row, cols, mats, nat or {}
 
 

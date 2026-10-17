@@ -28,6 +28,7 @@ include = ["brush_bridge*"]
 
 [tool.setuptools.package-data]
 "brush_bridge.gui" = ["icon.png"]
+"brush_bridge.formats" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

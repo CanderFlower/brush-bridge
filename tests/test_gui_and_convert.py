@@ -32,19 +32,201 @@ def test_open_export_diagnose(tmp_path):
     assert len(convert.expand_paths([tmp_path])) >= 3
 
 
-def test_main_window_smoke(qapp):
+def _wait(qapp, cond, timeout=5.0):
+    import time
+
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        qapp.processEvents()
+        if cond():
+            return True
+        time.sleep(0.005)
+    return cond()
+
+
+def _refs(n, counter=None, groups=("", "g")):
+    def thumb(i):
+        def f():
+            if counter is not None:
+                counter.append(i)
+            return Image.new("L", (10, 10), 128)
+        return f
+
+    return [BrushRef(name=f"b{i}", key=str(i), group=groups[i % len(groups)],
+                     loader=lambda i=i: Brush(name=f"b{i}"), thumbnail=thumb(i)) for i in range(n)]
+
+
+@pytest.fixture
+def win(qapp, monkeypatch):
+    """Main window that does not scan the real computer (no auto-selected source racing the test)."""
     from brush_bridge.gui import app as gui
 
+    monkeypatch.setattr(convert, "detect_all", lambda: [])
     w = gui.MainWindow()
-    refs = [BrushRef(name=f"b{i}", key=str(i), group="g" if i % 2 else "",
-                     loader=lambda i=i: Brush(name=f"b{i}"), thumbnail=lambda: Image.new("L", (10, 10), 128))
-            for i in range(5)]
-    w.transfer._show_refs(refs, "file", None)
-    assert w.transfer.grid.count() == 5
-    w.transfer._check_all(True)
-    assert len(w.transfer.checked_refs()) == 5
-    w.transfer.search.setText("b3")
-    assert sum(not w.transfer.grid.item(i).isHidden() for i in range(5)) == 1
+    w.resize(1100, 700)
+    w.show()
+    _wait(qapp, lambda: False, 0.1)  # let the (empty) detection finish
+    yield gui, w
+    w.close()
+    w.transfer.thumb_loader.wait()
+
+
+def test_main_window_smoke(qapp, win):
+    gui, w = win
+    t = w.transfer
+    t._show_refs(_refs(5), "file", None)
+    assert t.model.rowCount() == 5 and t.proxy.rowCount() == 5
+    t._check_all(True)
+    assert len(t.checked_refs()) == 5
+    t.search.setText("b3")
+    assert t.proxy.rowCount() == 1
     pm = gui.pil_to_pixmap(Image.new("L", (300, 100), 200))
     assert pm.width() == gui.THUMB
-    w.close()
+
+
+def test_grid_checking_updates_count(qapp, win):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    gui, w = win
+    t = w.transfer
+    t._show_refs(_refs(20), "file", None)
+    assert t.count.text() == "已选 0 个" and t.go.text() == "开始导入"
+
+    # through the model API (what the delegate/view use)
+    assert t.proxy.setData(t.proxy.index(2, 0), Qt.Checked, Qt.CheckStateRole)
+    assert t.model.checked == {2}
+    assert t.proxy.index(2, 0).data(Qt.CheckStateRole) == Qt.Checked
+    assert t.count.text() == "已选 1 个" and "（1）" in t.go.text()
+    t.proxy.setData(t.proxy.index(2, 0), Qt.Unchecked, Qt.CheckStateRole)
+    assert not t.model.checked and t.count.text() == "已选 0 个"
+
+    # a plain click toggles, a second click un-toggles, shift+click checks the range
+    grid = t.grid
+    qapp.processEvents()
+    centre = lambda r: grid.visualRect(t.proxy.index(r, 0)).center()  # noqa: E731
+    QTest.mouseClick(grid.viewport(), Qt.LeftButton, Qt.NoModifier, centre(1))
+    assert t.model.checked == {1} and t.count.text() == "已选 1 个"
+    QTest.mouseClick(grid.viewport(), Qt.LeftButton, Qt.ShiftModifier, centre(4))
+    assert t.model.checked == {1, 2, 3, 4} and "（4）" in t.go.text()
+    QTest.mouseClick(grid.viewport(), Qt.LeftButton, Qt.NoModifier, centre(3))
+    assert t.model.checked == {1, 2, 4}
+
+    # select all / none / invert act on the filtered rows only
+    t.group.setCurrentIndex(t.group.findData("g"))  # odd rows
+    t._check_all(True)
+    assert t.model.checked == {1, 2, 4} | set(range(1, 20, 2))
+    t._invert()
+    assert t.model.checked == {2, 4}
+    t.group.setCurrentIndex(0)
+    t._check_all(False)
+    assert not t.model.checked and t.count.text() == "已选 0 个"
+
+    # the checked state is painted: blue check box in the corner of the cell
+    t.model.set_checked([0], True)
+    img = grid.viewport().grab().toImage()
+    r0 = grid.visualRect(t.proxy.index(0, 0))
+    on = img.pixelColor(r0.left() + 2 + 6 + 4, r0.top() + 2 + 6 + 4)
+    r1 = grid.visualRect(t.proxy.index(1, 0))
+    off = img.pixelColor(r1.left() + 2 + 6 + 4, r1.top() + 2 + 6 + 4)
+    assert on.blue() > 200 and on.red() < 120, on.name()
+    assert off.red() > 200, off.name()
+
+
+def test_grid_large_library_is_virtualised(qapp, win):
+    import time
+
+    gui, w = win
+    t = w.transfer
+    calls: list[int] = []
+    refs = _refs(5000, calls)
+    t0 = time.perf_counter()
+    t._show_refs(refs, "file", None)
+    qapp.processEvents()
+    assert time.perf_counter() - t0 < 1.0
+    assert t.proxy.rowCount() == 5000
+
+    # only on-screen (and a screen of prefetch) thumbnails get requested
+    assert _wait(qapp, lambda: len(t.thumb_cache) > 0)
+    _wait(qapp, lambda: t.thumb_loader.pending_count() == 0, 3)
+    assert 0 < t.thumb_loader.requested < 300, t.thumb_loader.requested
+    assert len(calls) < 300 and max(calls) < 400
+    assert t.model.pixmap(0, request=False) is not None
+
+    # scrolling to the bottom loads the bottom rows, not everything in between
+    before = t.thumb_loader.requested
+    t.grid.scrollToBottom()
+    assert _wait(qapp, lambda: t.model.pixmap(4999, request=False) is not None)
+    assert t.thumb_loader.requested - before < 300
+
+    # filtering is cheap and does not rebuild anything
+    t0 = time.perf_counter()
+    t.search.setText("b4999")
+    assert t.proxy.rowCount() == 1
+    t.search.setText("b1")
+    n = t.proxy.rowCount()
+    t.search.setText("")
+    t.group.setCurrentIndex(t.group.findData("g"))
+    assert t.proxy.rowCount() == 2500
+    t.group.setCurrentIndex(0)
+    assert time.perf_counter() - t0 < 0.5
+    assert n == 1111 and t.proxy.rowCount() == 5000
+    t0 = time.perf_counter()
+    t._check_all(True)
+    assert len(t.checked_refs()) == 5000 and t.count.text() == "已选 5000 个"
+    t._invert()
+    assert not t.checked_refs()
+    assert time.perf_counter() - t0 < 0.5
+
+
+def test_thumbnail_loader_dedup_hold_and_retain(qapp):
+    from PySide6.QtGui import QImage
+
+    from brush_bridge.gui.brush_grid import ThumbnailLoader
+
+    seen = []
+    loader = ThumbnailLoader(lambda img: QImage(4, 4, QImage.Format_RGBA8888), max_threads=1)
+
+    def job(k):
+        def f():
+            seen.append(k)
+            return Image.new("L", (4, 4), 255)
+        return f
+
+    loader.hold(30)  # e.g. the user is scrolling: nothing starts
+    for k in range(10):
+        loader.request(k, job(k))
+        loader.request(k, job(k))  # duplicates are ignored
+    assert loader.requested == 10
+    _wait(qapp, lambda: False, 0.1)
+    assert seen == [] and loader.pending_count() == 10
+    assert loader.retain({7, 8, 9}) == 7  # rows scrolled away are cancelled
+    got = []
+    loader.ready.connect(lambda k, q: got.append(k))
+    loader.resume()
+    assert _wait(qapp, lambda: len(got) == 3)
+    assert seen == [9, 8, 7]  # most recently requested (= currently on screen) first
+    loader.shutdown()
+    assert loader.wait()
+
+
+def test_targets_offer_csp(qapp, win):
+    from brush_bridge.core.convert import DetectedApp
+    from brush_bridge.core.plugin import AppInstall, app
+
+    gui, w = win
+    t = w.transfer
+    csp = DetectedApp(app("csp"), AppInstall("csp", "Clip Studio Paint", "4.0.0"))
+    t.set_detected([csp])
+    items = [(t.target.itemText(i), t.target.itemData(i)) for i in range(t.target.count())]
+    kinds = [(d[0], getattr(d[1], "id", None)) for _, d in items]
+    assert ("app", None) in kinds and ("app_direct", None) in kinds
+    assert ("codec", "csp") in kinds
+    assert "💾 导出为文件：Clip Studio Paint 笔刷 (.sut)" in [x for x, _ in items]
+    writable = {c.id for c in convert.writable_codecs()}
+    assert {d[1].id for _, d in items if d[0] == "codec"} == writable
+    # the artist's choice survives a re-detection (e.g. the refresh after a transfer)
+    i = [x for x, _ in items].index("💾 导出为文件：Clip Studio Paint 笔刷 (.sut)")
+    t.target.setCurrentIndex(i)
+    t.set_detected([DetectedApp(app("csp"), AppInstall("csp", "Clip Studio Paint", "4.0.0"))])
+    assert t.target.currentData()[0] == "codec" and t.target.currentData()[1].id == "csp"

@@ -20,6 +20,7 @@ def main() -> int:
         "--icon", str(ROOT / "packaging" / "icon.ico"),
         "--collect-submodules", "brush_bridge",
         "--add-data", f"{ROOT / 'brush_bridge' / 'gui' / 'icon.png'};brush_bridge/gui",
+        "--add-data", f"{ROOT / 'brush_bridge' / 'formats' / 'csp_material_template.json'};brush_bridge/formats",
         "--exclude-module", "tkinter",
         "--exclude-module", "PySide6.QtWebEngineCore",
         "--exclude-module", "PySide6.Qt3DCore",
