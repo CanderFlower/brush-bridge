@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brush-bridge"
+dynamic = ["version"]
+description = "Convert and install brushes between Photoshop, Clip Studio Paint, Procreate, SAI2, Krita and GIMP"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["pillow>=10", "numpy>=1.24", "PySide6>=6.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6"]
+
+[project.scripts]
+brush-bridge-cli = "brush_bridge.cli:main"
+
+[project.gui-scripts]
+brush-bridge = "brush_bridge.gui.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "brush_bridge.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["brush_bridge*"]
+
+[tool.setuptools.package-data]
+"brush_bridge.gui" = ["icon.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
