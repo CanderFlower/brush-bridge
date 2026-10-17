@@ -100,7 +100,7 @@ def scan_brush_files(roots: Iterable[Path], budget_s: float = SCAN_BUDGET_S) -> 
 
     stack: list[tuple[Path, int, bool]] = [(Path(r), 0, False) for r in roots if r and Path(r).is_dir()]
     while stack:
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             break
         folder, depth, in_brushy = stack.pop(0)
         key = str(folder).lower()
@@ -112,7 +112,7 @@ def scan_brush_files(roots: Iterable[Path], budget_s: float = SCAN_BUDGET_S) -> 
         except OSError:
             continue
         for e in it:
-            if time.monotonic() > deadline:
+            if time.monotonic() >= deadline:
                 break
             try:
                 if e.is_file(follow_symlinks=False):

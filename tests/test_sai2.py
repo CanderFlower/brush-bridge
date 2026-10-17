@@ -167,7 +167,7 @@ def _inst(root: Path, **extra) -> AppInstall:
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -286,9 +286,9 @@ def _brushes():
 def test_write_package_and_read_back(tmp_path):
     files = codec("sai2").write(_brushes(), tmp_path / "pkg.saitdat")
     pkg = tmp_path / "pkg"
-    rel = {str(f.relative_to(pkg)) for f in files}
-    assert {"scatter\\测试散布.bmp", "scatter\\测试散布.ini", "brushfom\\brshape\\测试形状.bmp",
-            "brushtex\\噪点.bmp", "安装说明.txt"} <= rel
+    rel = {f.relative_to(pkg).as_posix() for f in files}
+    assert {"scatter/测试散布.bmp", "scatter/测试散布.ini", "brushfom/brshape/测试形状.bmp",
+            "brushtex/噪点.bmp", "安装说明.txt"} <= rel
     assert len(list((pkg / "custool" / "nrm").glob("*.saitdat"))) == 5
     with Image.open(pkg / "brushtex" / "噪点.bmp") as im:
         assert im.size == (512, 512) and im.mode in ("L", "P")
@@ -344,7 +344,7 @@ def test_install_closed_creates_group_with_backups(settings, monkeypatch):
     assert "导入笔刷" in res.message and "散布形状" in res.message
     nrm = settings / "custool" / "nrm"
     assert (settings / "scatter" / "测试散布 (2).bmp").is_file()
-    assert (settings / "scatter" / "测试散布.bmp").read_bytes() == before["scatter\\测试散布.bmp"]
+    assert (settings / "scatter" / "测试散布.bmp").read_bytes() == before["scatter/测试散布.bmp"]
     new_ids = sorted(int(f.stem) for f in nrm.glob("*.saitdat") if f.name not in ("1.saitdat", "2.saitdat"))
     assert new_ids[0] == 8  # after the highest id in custool and custool\bak
     groups = s.tool_groups(nrm)
@@ -352,8 +352,8 @@ def test_install_closed_creates_group_with_backups(settings, monkeypatch):
     assert [t for _s, t in groups[1][2]] == new_ids
     # existing files are only modified after a backup, all others untouched
     changed = {k for k, v in before.items() if (settings / k).read_bytes() != v}
-    assert changed == {"custool\\nrm\\_0.saitset"}
-    assert res.backup and res.backup.read_bytes() == before["custool\\nrm\\_0.saitset"]
+    assert changed == {"custool/nrm/_0.saitset"}
+    assert res.backup and res.backup.read_bytes() == before["custool/nrm/_0.saitset"]
 
     refs = ad.list_brushes(_inst(settings))
     group_refs = [r.name for r in refs if r.group.endswith("导入笔刷")]
@@ -377,7 +377,7 @@ def test_install_running_only_copies_assets(settings, monkeypatch):
     after = _snapshot(settings)
     assert all(after[k] == v for k, v in before.items())
     assert not any(k.startswith("custool") for k in set(after) - set(before))
-    assert "scatter\\测试散布.bmp" in after and "brushtex\\噪点.bmp" in after
+    assert "scatter/测试散布.bmp" in after and "brushtex/噪点.bmp" in after
 
 
 def test_install_running_nothing_but_tools_is_refused(settings, monkeypatch):
