@@ -262,7 +262,7 @@ textures). The builder reproduces CSP's own `Offscreen` attribute, empty and pix
 | `BrushPatternReverseHorizontal/Vertical` | `flip_x/flip_y` | |
 | `BrushUseSpray`, `BrushSpraySize(+Unit, SyncBrushSize)`, `BrushSprayDensity(+Effector)` | `size_px`, `spacing`, `scatter`, `scatter_both_axes`, `count`, `count_jitter` | see "Spray semantics" below |
 | `BrushUseIn/Out`, `BrushIn/OutLength(+Unit)`, `BrushInOutType` | `taper_start/end` | length px ÷ 100 (type 1 = %) |
-| `TextureImage`, `TextureCompositeMode`, `TextureScale2`, `TextureDensity(+Effector)`, `TextureReverseDensity`, `TextureBrightness`, `TextureContrast`, `TextureForPlot` | `texture` | composite mode 0 = multiply, 1 = subtract **(inferred)** |
+| `TextureImage`, `TextureCompositeMode`, `TextureScale2`, `TextureDensity(+Effector)`, `TextureReverseDensity`, `TextureBrightness`, `TextureContrast`, `TextureForPlot` | `texture` | composite mode 0 = multiply (inferred), 1 = subtract — verified in CSP 5.1.2: subtract removes paint where the texture image is **light** (white-background/black-dot test texture leaves only the dots). This matches Procreate's subtract grain mode (bright grain subtracts), so the grain image is carried over unchanged. |
 | `UseDualBrush`, `Dual*` | `dual` | |
 | `BrushChangePatternColor` / `BrushChangeStrokeColor` + `Brush[Stroke]Hue/Saturation/Value/SubColor…` | `color` | hue range 0–180 → 0–1 |
 | `BrushUseWaterColor`, `BrushMixColor`, `BrushMixAlpha`, `BrushMixColorExtension` | `wet` | load = paint amount, wetness = 1 − paint density |
