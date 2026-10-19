@@ -75,6 +75,13 @@ introduced them.
 * From factory tools: 138 liquify, 139 mixing brushes, 141 new gradients, 142 circular text,
   143 rough pen, 144 lasso fill / magnetic lasso, 145 dynamic eraser.
 * An exported sample with `Version 142` imports fine into 5.1.2.
+* Corpus check (61 .sut files from many releases): `Version` 139–144 share an identical Variant column
+  set. 138 (late 1.x) lacks `BrushColorMixingMode` and `BrushLMSLinearity`; 145 (5.x) adds
+  `BrushBlurKind` and `BrushQuality`.
+
+Writing: brush-bridge writes `Version 139` by default (readable by 2.0 and later). With a target
+version it uses `manager_version_for()` (1.x → 138, 2.x–4.x → 139, 5.x → 145) and drops the
+columns listed in `COLUMNS_SINCE` that the target doesn't know.
 
 There is no public table that maps these numbers to marketing versions. So brush-bridge compares a
 file against the **installed** CSP at runtime: it copies the factory todb and reads its

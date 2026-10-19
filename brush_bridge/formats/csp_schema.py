@@ -27,7 +27,30 @@ EMPTY_UUID = b"\x00"  # CSP stores "no node" as a single zero byte
 # Manager.Version anchors that were verified on real installs. Each CSP release that adds tool
 # parameters bumps it; Node.NodeInstalledVersion of factory sub tools uses the same counter.
 VERIFIED_VERSIONS = {145: "5.1"}
-DEFAULT_WRITE_VERSION = 142  # verified to import into CSP 5.1.2 (sample exported by an older CSP)
+# Manager.Version 139..144 share one Variant column set (checked on .sut files exported by many CSP
+# releases), so 139 is the most compatible version for that set: CSP refuses files newer than itself.
+DEFAULT_WRITE_VERSION = 139
+# Variant columns and the first Manager.Version that has them (older CSP refuses unknown columns)
+COLUMNS_SINCE = {"BrushColorMixingMode": 139, "BrushLMSLinearity": 139, "BrushBlurKind": 145, "BrushQuality": 145}
+# Clip Studio Paint release -> newest Manager.Version it is known to read
+#   138: last 1.x releases (no colour-mixing mode); 139: 2.0 ... 4.x; 145: 5.x
+APP_SERIES = [((5, 0), 145), ((2, 0), 139), ((0, 0), 138)]
+TARGET_CHOICES = {"auto": "", "1.x": "1.13", "2.x – 4.x": "2.0", "5.x 及以上": "5.0"}
+
+
+def manager_version_for(app_version: str) -> Optional[int]:
+    """Newest Manager.Version that the CSP release ``app_version`` (e.g. "1.13.2", "5.1.2") reads."""
+    import re
+
+    m = re.match(r"\s*(\d+)(?:\.(\d+))?", app_version or "")
+    if not m:
+        return None
+    key = (int(m.group(1)), int(m.group(2) or 0))
+    return next(v for k, v in APP_SERIES if key >= k)
+
+
+def columns_for(manager_version: int, cols: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(c, t) for c, t in cols if COLUMNS_SINCE.get(c, 0) <= manager_version]
 
 # Constants that are identical in every CSP tool database we have seen.
 COMMON_VARIANT_ID = 44

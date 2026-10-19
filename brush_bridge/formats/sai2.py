@@ -733,12 +733,16 @@ def read_settings(root: Path, categories: tuple[str, ...] = ("nrm", "ink")) -> l
 # ---------------------------------------------------------------------------------------------
 def choose_mode(b: Brush) -> str:
     """'scatter' (scatter tool + scatter shape), 'brshape' (brush + brush shape) or 'round'."""
-    needs_scatter = (b.count > 1 or b.count_jitter > 0 or b.scatter > 0.5 or b.spacing > 0.5
-                     or b.color.has_jitter())
+    # wet mixing only exists on brush-shape tools, so a wet brush keeps it and gets its scatter capped at 50%
+    needs_scatter = (b.count > 1 or b.count_jitter > 0 or (b.scatter > 0.5 and not b.wet.enabled)
+                     or b.spacing > 0.5 or (b.color.has_jitter() and not b.wet.enabled))
     if b.is_eraser:
         return "brshape" if b.tips else "round"
     if needs_scatter:
         return "scatter"
+    # a round tip with scatter/angle jitter/visible spacing needs a real shape so SAI2 can apply them
+    if not b.tips and (b.scatter >= 0.1 or b.spacing > 0.15 or (b.angle_jitter > 0 and b.roundness < 0.95)):
+        return "brshape"
     return "brshape" if b.tips else "round"
 
 
@@ -800,7 +804,9 @@ def compose_tool(b: Brush, mode: str, fom: Optional[str], tex: Optional[str], te
         tid = "brush"
     sec = tool_template(tid)
     size = _clamp(b.size_px, 0.1, 5000)
-    sp, op = _clamp(b.size_dynamic.pressure, 0, 1), _clamp(b.opacity_dynamic.pressure, 0, 1)
+    # SAI2 has no flow pressure; density pressure is the closest equivalent
+    sp = _clamp(b.size_dynamic.pressure, 0, 1)
+    op = _clamp(max(b.opacity_dynamic.pressure, b.flow_dynamic.pressure), 0, 1)
     dens = b.opacity if mode != "round" else b.opacity * b.flow
     vals: dict[str, Any] = {
         "cursize": int(round(size * 10)), "curszscl": 0 if size < 10 else (1 if size <= 1000 else 10),
@@ -846,7 +852,7 @@ def _write_warnings(b: Brush, mode: str) -> None:
         b.warn("SAI2 只支持笔压，倾斜和速度动态已忽略。")
     if mode == "scatter" and b.wet.enabled:
         b.warn("SAI2 的散布工具不支持混色，已忽略湿画效果。")
-    if mode != "scatter" and b.tips and (b.scatter > 0.5 or b.spacing > 0.5):
+    if mode == "brshape" and (b.scatter > 0.5 or b.spacing > 0.5):
         b.warn("SAI2 笔刷形状的间距/散布最大 50%，已截断。")
     b.warn_extras("SAI2")
 
@@ -949,7 +955,11 @@ def export_brushes(brushes: list[Brush], root: Path, *, tools_dir: Optional[Path
                 if mode != "round":
                     if fom_asset is None or fom_asset.kind != mode:
                         ini = ini_strings(shape_params_from_brush(b, mode))
-                        fom_asset = Asset(mode, b.name, prepare_tip(b.main_tip()), ini)
+                        tip = b.main_tip()
+                        if not b.tips:  # computed tip: keep it unrotated, the tool's Angle rotates it
+                            from ..core.imaging import round_tip
+                            tip = round_tip(max(8, min(int(round(b.size_px)), 512)), b.hardness, b.roundness, 0)
+                        fom_asset = Asset(mode, b.name, prepare_tip(tip), ini)
                     fom = aw.put(fom_asset)
                     res.assets.append((mode, fom))
                 if b.texture is not None:

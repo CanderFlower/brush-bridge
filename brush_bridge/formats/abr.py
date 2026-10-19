@@ -310,6 +310,34 @@ def packbits_encode_row(row: bytes) -> bytes:
     return bytes(out)
 
 
+def _bare_channel(r: _Reader, end: int) -> Optional[Image.Image]:
+    top, left, bottom, right = (r.i32() for _ in range(4))
+    depth = r.u16()
+    comp = r.u8()
+    h, w = bottom - top, right - left
+    if h <= 0 or w <= 0 or h > 30000 or w > 30000:
+        return None
+    bpp = 2 if depth == 16 else 1
+    row_bytes = w * bpp
+    if comp == 1:
+        counts = struct.unpack_from(f">{h}H", r.d, r.p)
+        r.p += 2 * h
+        rows = []
+        for c in counts:
+            rows.append(packbits_decode(bytes(r.d[r.p:r.p + c]), row_bytes))
+            r.p += c
+        buf = b"".join(rows)
+    else:
+        buf = bytes(r.d[r.p:r.p + h * row_bytes])
+    if r.p > end or len(buf) < h * row_bytes:
+        return None
+    if bpp == 2:
+        arr = (np.frombuffer(buf[:h * row_bytes], ">u2").reshape(h, w) >> 8).astype(np.uint8)
+    else:
+        arr = np.frombuffer(buf[:h * row_bytes], np.uint8).reshape(h, w)
+    return Image.fromarray(arr, "L")
+
+
 def decode_channel(r: _Reader, end: int) -> Optional[tuple[np.ndarray, int]]:
     """Read one VMAL channel at ``r.p`` → (uint8 array HxW, depth) or None if not written."""
     if r.p + 4 > end or r.u32() == 0:
@@ -512,6 +540,10 @@ def sample_image(af: AbrFile, uid: str) -> Optional[Image.Image]:
     r = _Reader(af.data, s + 4)
     r.pstr()
     end = s + ln
+    if af.version == 6 and af.subversion == 1:
+        # ABR 6.1 (Photoshop CS): 10 unknown bytes, then a bare bounds/depth/compression header
+        r.p += 10
+        return _bare_channel(r, end)
     r.u32()  # 0x00010000
     r.u32()  # VMAL version 3
     r.u32()  # VMAL length
@@ -770,7 +802,7 @@ def preset_to_brush(af: AbrFile, idx: int) -> Brush:
     pattern_ids = [str(p.sub("Txtr").get("Idnt"))] if p.get("useTexture") and p.sub("Txtr").get("Idnt") else []
     br.source.native = {
         "abr_desc": af.raw(a, b),
-        "abr_samples": {u: af.raw(*_span(af.samples[u])) for u in sample_ids if u in af.samples},
+        "abr_samples": _native_samples(af, sample_ids),
         "abr_patterns": {u: af.raw(*_span(af.patterns[u])) for u in pattern_ids if u in af.patterns},
     }
     return br
@@ -778,6 +810,21 @@ def preset_to_brush(af: AbrFile, idx: int) -> Brush:
 
 def _span(t: tuple[int, int]) -> tuple[int, int]:
     return t[0], t[0] + t[1]
+
+
+def _native_samples(af: AbrFile, ids) -> dict[str, bytes]:
+    """Raw sample entries for lossless re-export; 6.1 entries are re-encoded since we always write 6.2."""
+    out = {}
+    for u in ids:
+        if not u or u not in af.samples:
+            continue
+        if af.version == 6 and af.subversion == 1:
+            img = sample_image(af, u)
+            if img is not None:
+                out[u] = _sample_entry(img, u)
+        else:
+            out[u] = af.raw(*_span(af.samples[u]))
+    return out
 
 
 def _brvr(dyn: Dynamic, minimum_out: list) -> Desc:
@@ -1040,7 +1087,7 @@ def _native_only(af: AbrFile, idx: int) -> Brush:
     br.source = BrushSource(app="photoshop", format="abr", version=af.version_str, path=str(af.path), index=idx)
     br.source.native = {
         "abr_desc": af.raw(a, b),
-        "abr_samples": {u: af.raw(*_span(af.samples[u])) for u in sids if u and u in af.samples},
+        "abr_samples": _native_samples(af, sids),
         "abr_patterns": {pid: af.raw(*_span(af.patterns[pid]))} if pid and pid in af.patterns else {},
     }
     return br
@@ -1186,13 +1233,15 @@ class AbrCodec(FormatCodec):
             major = int(info.version.split(".")[0])
         except ValueError:
             return None
-        if major >= 7 and app_id in ("csp", "krita", "gimp", "sai2"):
-            return f"ABR v{info.version} 是 Photoshop 2020 之后的预设库格式，该软件只认 v6 及更早的格式。"
-        if major >= 6 and app_id == "photoshop":
+        if major >= 7 and app_id in ("csp", "krita", "sai2"):
+            return f"ABR v{info.version} 是 Photoshop CC 2018 之后的新格式，该软件只认 v6 及更早的格式。"
+        if app_id == "photoshop":
             try:
                 ps_major = int(app_version.split(".")[0])
             except ValueError:
                 return None
-            if ps_major and ps_major < 13:
-                return "该笔刷需要 Photoshop CS6 或更高版本。"
+            if major >= 7 and 0 < ps_major < 19:
+                return "该笔刷是 Photoshop CC 2018 及以后的格式（ABR v10），旧版 Photoshop 无法读取。"
+            if major >= 6 and 0 < ps_major < 7:
+                return "该笔刷需要 Photoshop 7.0 或更高版本。"
         return None

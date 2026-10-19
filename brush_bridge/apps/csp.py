@@ -1,4 +1,4 @@
-"""Clip Studio Paint adapter.
+﻿"""Clip Studio Paint adapter.
 
 Detection, listing of the user's sub tools (read from a *copy* of ``EditImageTool.todb``) and
 installation. Default installation (strategy B) exports .sut / .abr files the user drags into the
@@ -154,9 +154,9 @@ class CspAdapter(AppAdapter):
             return InstallResult(False, "没有选择任何笔刷。")
         if options.get("direct", False):
             return self._install_direct(inst, brushes, **options)
-        return self._export(brushes, options.get("out_dir"))
+        return self._export(brushes, options.get("out_dir"), target_version=options.get("csp_version") or inst.version)
 
-    def _export(self, brushes: list[Brush], out_dir=None, intro: str = "") -> InstallResult:
+    def _export(self, brushes: list[Brush], out_dir=None, intro: str = "", target_version: str = "") -> InstallResult:
         out = Path(out_dir) if out_dir else export_dir("CSP")
         out.mkdir(parents=True, exist_ok=True)
         files: list[Path] = []
@@ -165,7 +165,7 @@ class CspAdapter(AppAdapter):
             dst = unique_path(out / f"{safe_filename(b.name)}.sut")
             if loses_images(b):
                 lossy.append(b)
-            files.append(write_sut(b, dst))
+            files.append(write_sut(b, dst, target_version=target_version or ""))
         msg = (intro + "\n\n" if intro else "") + f"已导出 {len(files)} 个 Clip Studio Paint 子工具文件（.sut）到：\n{out}\n{_DRAG_HINT}"
         if lossy:
             from ..core.plugin import codec
@@ -187,7 +187,7 @@ class CspAdapter(AppAdapter):
         todb = Path(options.get("todb") or inst.extra.get("todb") or "")
         if not todb.is_file():
             return InstallResult(False, "找不到 Clip Studio Paint 的工具数据库（EditImageTool.todb），已改为导出文件。\n"
-                                 + self._export(brushes).message)
+                                 + self._export(brushes, target_version=inst.version).message)
         if self.is_running(inst):
             return InstallResult(False, "请先关闭 Clip Studio Paint，再安装笔刷（直接写入工具设置需要软件处于关闭状态）。",
                                  needs_app_closed=True)
@@ -213,7 +213,8 @@ class CspAdapter(AppAdapter):
                    f"工具的「{group}」子工具组中找到。\n原设置已备份到：{bak}")
         if fallback:
             res = self._export(fallback, options.get("out_dir"),
-                               intro=msg + ("\n\n" if msg else "") + f"{len(fallback)} 个笔刷使用了素材，无法直接写入，已改为导出文件。")
+                               intro=msg + ("\n\n" if msg else "") + f"{len(fallback)} 个笔刷使用了素材，无法直接写入，已改为导出文件。",
+                               target_version=inst.version)
             res.backup = bak
             return res
         notes = sorted({n for b in direct for n in b.notes})

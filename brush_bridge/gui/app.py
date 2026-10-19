@@ -12,7 +12,7 @@ from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout,     QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSplitter, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
@@ -33,6 +33,16 @@ ROLE_SRC = Qt.UserRole + 2
 # Friendlier names for export targets (codec names come from the format plugins).
 CODEC_LABELS = {
     "csp": "Clip Studio Paint 笔刷 (.sut)",
+}
+
+
+# Exported files may be opened on another computer with an older app; let the user pick its version.
+EXPORT_VERSIONS = {
+    "csp": ("Clip Studio Paint", "target_version",
+            [("自动（兼容 2.0 及以上，推荐）", ""), ("1.x 旧版", "1.13"), ("2.x – 4.x", "2.0"), ("5.x 及以上", "5.0")]),
+    "krita": ("Krita", "krita_version", [("Krita 5（推荐）", ""), ("Krita 4", "4")]),
+    "mypaint": ("MyPaint / GIMP / Krita", "mypaint_version",
+                [("新版 v3（MyPaint 1.1+、GIMP 2.10+、Krita 5，推荐）", 3), ("旧版 v2（MyPaint 1.0 及更早）", 2)]),
 }
 
 
@@ -435,7 +445,17 @@ class TransferPage(QWidget):
             path, _ = QFileDialog.getSaveFileName(self, "导出为", str(default) + ext, f"{codec_label(obj)} (*{ext})")
             if not path:
                 return
-            self._run_transfer(refs, lambda brushes: self._export(obj, brushes, Path(path)))
+            opts = {}
+            if obj.id in EXPORT_VERSIONS:
+                app_name, key, choices = EXPORT_VERSIONS[obj.id]
+                label, ok = QInputDialog.getItem(self, "目标软件版本", f"要在哪个版本的 {app_name} 里使用？",
+                                                 [c[0] for c in choices], 0, False)
+                if not ok:
+                    return
+                value = dict(choices)[label]
+                if value:
+                    opts[key] = value
+            self._run_transfer(refs, lambda brushes: self._export(obj, brushes, Path(path), **opts))
         else:
             target: DetectedApp = obj
             if target.install and target.adapter.is_running(target.install) and \
@@ -451,8 +471,8 @@ class TransferPage(QWidget):
                 return
             self._run_transfer(refs, lambda brushes: self._install(target, brushes, **opts))
 
-    def _export(self, c, brushes, path: Path):
-        files = convert.export(brushes, c.id, path)
+    def _export(self, c, brushes, path: Path, **opts):
+        files = convert.export(brushes, c.id, path, **opts)
         notes = sorted({n for b in brushes for n in b.notes})
         msg = f"已导出 {len(brushes)} 个笔刷。"
         if notes:

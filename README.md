@@ -1,6 +1,6 @@
 # Brush Bridge 笔刷桥
 
-**在 Photoshop、Clip Studio Paint (CSP)、Procreate、SAI2、Krita、GIMP 之间搬运笔刷的桌面工具。**
+**在 Photoshop、Clip Studio Paint (CSP)、Procreate、SAI2、Krita、GIMP、MyPaint 之间搬运笔刷的桌面工具。**
 面向画师设计：不用命令行，勾选笔刷 → 选择目标软件 → 点「开始导入」。
 
 [English](#english) · [下载](https://github.com/CanderFlower/brush-bridge/releases/latest) · MIT License
@@ -13,7 +13,7 @@
 |---|---|
 | 💻 检测软件和版本 | 自动找到电脑上安装的绘画软件、版本号、是否正在运行、笔刷保存位置 |
 | 🖌 直接浏览已装的笔刷 | 直接读取 Photoshop 画笔库、CSP 辅助工具、SAI2 自定义工具、Krita 资源包、GIMP 笔刷，带缩略图、搜索，并按软件里原本的分组（如 PS 的多层画笔组、CSP 的「工具 → 子工具组」）显示成文件夹树 |
-| 📄 打开外部笔刷文件 | 把 `.abr` `.sut` `.brush` `.brushset` `.bundle` `.kpp` `.gbr` `.gih` 或 PNG 图片拖进窗口即可 |
+| 📄 打开外部笔刷文件 | 把 `.abr` `.sut` `.brush` `.brushset` `.bundle` `.kpp` `.gbr` `.gih` `.myb` 或 PNG 图片拖进窗口即可 |
 | 🚚 一键导入 | 选好目标软件，自动转换格式并导入；做不到全自动的软件会给出明确的操作提示 |
 | 🔧 修复导入失败 | 例如新版 Photoshop 导出的 ABR v10 在 CSP 里报错，可一键转成通用的 v6.2 格式（无损） |
 
@@ -27,6 +27,7 @@
 | Procreate（iPad） | — 无法在电脑上检测 | ✅ .brush / .brushset | ✅ .brushset | 📱 生成文件，传到 iPad 点开即可 |
 | Krita | ✅ 资源包 | ✅ .bundle / .kpp | ✅ .bundle | ✅ 放入资源文件夹，重启 Krita 生效 |
 | GIMP | ✅ 用户笔刷 | ✅ .gbr / .gih / .vbr | ✅ .gbr | ✅ 放入笔刷文件夹，刷新即可 |
+| MyPaint | ✅ 用户笔刷 | ✅ .myb v1/v2/v3 | ✅ .myb v3 / v2 | ✅ 放入笔刷文件夹，重启 MyPaint 生效 |
 | 图片 | — | ✅ PNG/JPG 等作为笔尖 | ✅ PNG | — |
 
 > 同一软件内的「原样搬运」（例如 Photoshop 画笔库 → .abr 文件 → CSP）会保留原始数据，不损失任何参数。
@@ -34,6 +35,22 @@
 > 无法对应的效果会在结果里明确提示。转到 CSP 时，Procreate 的湿边/灼边会映射为「水彩边界」，
 > 压力/倾斜颜色（色相、饱和度、亮度）映射为笔尖颜色变化的压力/倾斜输入，倾斜渗流/渐变映射为倾斜控制的浓度。
 > 转到 CSP 时，自定义笔尖、纸纹和双重画笔会以原始分辨率生成为 CSP 素材，直接内嵌在 .sut 里。
+
+## 不同版本的软件
+
+导出时可以选择目标软件的版本，生成的文件会按该版本能读取的格式写入；默认使用兼容面最广的格式。
+
+| 软件 | 兼容范围 |
+|---|---|
+| Photoshop | 导出 .abr v6.2，Photoshop 7.0 及以后都能读取；读取 v1/v2/v6/v10 |
+| Clip Studio Paint | 默认按 2.x–5.x 通用格式写；可选 1.x 格式（去掉 1.x 不认识的参数） |
+| Procreate | 导出 Procreate 5 及以后的格式（Procreate 4 无法导入 5 的笔刷） |
+| Krita | 默认 Krita 5 资源包；可选 Krita 4 及更早（.kpp 2.2） |
+| MyPaint | 默认 v3（MyPaint 1.1+、GIMP 2.10+、Krita 5 可读）；可选 v2 给更老的版本 |
+| SAI2 / GIMP | 写入各自通用的格式 |
+
+> 已用 600 多个来自不同网站、不同风格的公开笔刷（ABR、SUT、Krita、MyPaint、SAI2、Procreate）做过互转测试，全部能读取；
+> 剩余的差异主要是目标格式本身不支持的效果，会在结果里提示。
 
 ## 使用方法
 
@@ -68,17 +85,18 @@ python scripts/build_exe.py   # 打包 dist/BrushBridge.exe
 ## 许可
 
 MIT。本仓库不包含任何商业笔刷；测试用的公开笔刷在测试时下载，来源与许可见 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)。
-Photoshop、Clip Studio Paint、Procreate、PaintTool SAI、Krita、GIMP 是其各自所有者的商标，本项目与它们无关。
+Photoshop、Clip Studio Paint、Procreate、PaintTool SAI、Krita、GIMP、MyPaint 是其各自所有者的商标，本项目与它们无关。
 
 ---
 
 ## English
 
-**Brush Bridge** is a friendly desktop app that moves brushes between Photoshop, Clip Studio Paint, Procreate, PaintTool SAI 2, Krita and GIMP.
+**Brush Bridge** is a friendly desktop app that moves brushes between Photoshop, Clip Studio Paint, Procreate, PaintTool SAI 2, Krita, GIMP and MyPaint.
 
 - Detects installed painting apps and their versions.
 - Browses the brushes already installed in each app (thumbnails, groups, search).
-- Opens external brush files (`.abr`, `.sut`, `.brush`, `.brushset`, `.bundle`, `.kpp`, `.gbr`, `.gih`, images) by drag & drop.
+- Opens external brush files (`.abr`, `.sut`, `.brush`, `.brushset`, `.bundle`, `.kpp`, `.gbr`, `.gih`, `.myb`, images) by drag & drop.
+- Writes files for a chosen target app version (e.g. CSP 1.x / 2.x–5.x, Krita 4 / 5, MyPaint v2 / v3).
 - One-click conversion + installation into the target app (with automatic backups when writing app settings).
 - Diagnoses files that an app refuses to import and repairs them (e.g. Photoshop 2020+ ABR v10 → v6.2 for Clip Studio Paint).
 

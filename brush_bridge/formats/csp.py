@@ -321,13 +321,25 @@ def spray_layout(size_px: float, spacing: float, scatter: float, count: int) -> 
 
     With spray on, CSP treats BrushSize as the spray *area* (particle centres land inside it) and
     BrushSpraySize as the particle size; synced to the brush size so pressure still scales both.
-    Without scatter, extra tips per dab are approximated by a proportionally denser interval.
+    Without scatter, extra tips per dab land on the same spot. Continuous strokes approximate them with a
+    proportionally denser interval; separated stamps (spacing >= 50%) keep their spacing and the caller
+    raises the flow instead (see ``stacked_flow``).
     """
     size_px = max(0.1, size_px)
     if scatter >= SPRAY_MIN_SCATTER:
         area = 2 * scatter * size_px
         return True, area, round(100 / (2 * scatter), 2), round(max(0.01, spacing * size_px / area) * 100, 2)
+    if spacing >= STAMP_SPACING:
+        return False, size_px, 100.0, round(spacing * 100, 2)
     return False, size_px, 100.0, round(max(0.01, spacing / max(1, count)) * 100, 2)
+
+
+STAMP_SPACING = 0.5
+
+
+def stacked_flow(flow: float, count: int) -> float:
+    """Opacity of ``count`` dabs of ``flow`` stacked on the same spot."""
+    return 1 - (1 - _clamp(flow)) ** max(1, count)
 
 
 def brush_columns(b: Brush) -> dict[str, object]:
@@ -336,7 +348,9 @@ def brush_columns(b: Brush) -> dict[str, object]:
     rot = ROT_BASE | (ROT_DIRECTION if b.angle_follow_stroke else 0) | (ROT_RANDOM if b.angle_jitter > 0 else 0)
     spray, area, particle_pct, interval = spray_layout(b.size_px, b.spacing, b.scatter, b.count)
     if not spray and b.count > 1:
-        b.warn(f"每次落笔 {b.count} 个笔尖且没有位置散布，Clip Studio Paint 中已改为用更密的间隔近似。")
+        how = "提高流量" if b.spacing >= STAMP_SPACING else "更密的间隔"
+        b.warn(f"每次落笔 {b.count} 个笔尖且没有位置散布，Clip Studio Paint 中已改为用{how}来近似叠加效果。")
+    flow = stacked_flow(b.flow, b.count) if not spray and b.spacing >= STAMP_SPACING else b.flow
     c: dict[str, object] = {
         "Opacity": int(round(_clamp(b.opacity) * 100)),
         "AntiAlias": 1 if b.antialias else 0,
@@ -346,7 +360,7 @@ def brush_columns(b: Brush) -> dict[str, object]:
         "BrushSizeUnit": 0,
         "BrushSizeEffector": _enc(b.size_dynamic),
         "BrushOpacityEffector": _enc(b.opacity_dynamic),
-        "BrushFlow": int(round(_clamp(b.flow) * 100)),
+        "BrushFlow": int(round(_clamp(flow) * 100)),
         "BrushFlowEffector": _enc(b.flow_dynamic),
         "BrushHardness": int(round(_clamp(b.hardness) * 100)),
         "BrushInterval": interval,
@@ -649,7 +663,8 @@ class CspCodec(FormatCodec):
                 dst = unique_path(out_path.parent / f"{safe_filename(b.name)}.sut")
             if dst.exists():
                 dst.unlink()
-            write_sut(b, dst, version=options.get("version"))
+            write_sut(b, dst, version=options.get("version"),
+                      target_version=str(options.get("csp_version") or options.get("target_version") or ""))
             files.append(dst)
         return files
 
@@ -719,11 +734,22 @@ def _default_cols() -> list[tuple[str, str]]:
     return [("VariantID", "INTEGER")] + [(n, t) for n, t, _ in S.VARIANT_COLUMNS]
 
 
-def write_sut(b: Brush, dst: Path, version: Optional[int] = None) -> Path:
+def write_sut(b: Brush, dst: Path, version: Optional[int] = None, target_version: str = "") -> Path:
+    """Write ``b`` as a one-sub-tool .sut. ``target_version`` (a CSP release such as "1.13" or "5.1")
+    caps the file version and drops parameters that release does not know."""
     row, cols, mats, nat = build_variant(b)
     node_uuid = S.new_uuid()
     mgr_old = nat.get("manager") or {}
     ver = int(version or mgr_old.get("Version") or S.DEFAULT_WRITE_VERSION)
+    cap = S.manager_version_for(target_version) if target_version else None
+    if cap is not None and not version:
+        ver = min(ver, cap)
+    kept = S.columns_for(ver, cols)
+    if len(kept) != len(cols):
+        dropped = {c for c, _ in cols} - {c for c, _ in kept}
+        if row.get("BrushColorMixingMode") or row.get("BrushQuality"):
+            b.warn(f"目标 Clip Studio Paint 版本较旧，不支持参数：{'、'.join(sorted(dropped))}，已移除。")
+        cols = kept
     node_old = dict(nat.get("node") or {})
     op, icon = (S.OP_ERASER, S.ICON_ERASER) if b.is_eraser else (S.OP_BRUSH, S.ICON_BRUSH)
     if node_old.get("NodeInputOp") in S.PAINT_OPS and bool(node_old.get("NodeInputOp") == S.OP_ERASER) == b.is_eraser:

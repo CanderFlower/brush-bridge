@@ -1130,6 +1130,15 @@ class ProcreateCodec(FormatCodec):
                 info.problems.append(f"有 {broken} 个笔刷的参数文件已损坏，无法读取。")
             return info
 
+    def compatibility(self, info: FileInfo, app_id: str, app_version: str) -> Optional[str]:
+        if app_id != "procreate" or not app_version:
+            return None
+        nums = [int(x) for x in re.findall(r"\d+", app_version)[:1]] + [0]
+        # every Procreate 5.x reads SilicaBrush v2 archives and ignores keys it doesn't know
+        if info.version in ("5", "5.2+", "5.4+") and nums[0] < 5:
+            return "该笔刷是 Procreate 5 格式，Procreate 4 及更早版本无法导入。"
+        return None
+
     def list_refs(self, path: Path) -> list[BrushRef]:
         path = Path(path)
         refs = []

@@ -38,6 +38,10 @@ from xml.sax.saxutils import escape as _xml_escape, quoteattr as _quoteattr
 import numpy as np
 from PIL import Image, ImageOps, PngImagePlugin
 
+# Krita 5 presets embed their textures/tips as base64 in the "preset" zTXt chunk; these exceed PIL's 1 MB default.
+PngImagePlugin.MAX_TEXT_CHUNK = max(PngImagePlugin.MAX_TEXT_CHUNK, 256 * 1024 * 1024)
+PngImagePlugin.MAX_TEXT_MEMORY = max(PngImagePlugin.MAX_TEXT_MEMORY, 512 * 1024 * 1024)
+
 from ..core.imaging import fit, round_tip, stroke_preview
 from ..core.model import Brush, BrushRef, BrushSource, ColorDynamics, DualTip, Dynamic, Texture
 from ..core.plugin import FileInfo, FormatCodec, Fix, register_codec
@@ -624,13 +628,16 @@ def preset_to_brush(p: KritaPreset, resolver: ResourceResolver, path: str = "", 
     pr = p.params
     # KisPaintOpPreset::name() shows underscores as spaces.
     b = Brush(name=p.name.replace("_", " "), group=group)
-    if p.paintop and p.paintop != "paintbrush":
+    if p.paintop and p.paintop not in ("paintbrush", "colorsmudge"):
         b.warn(f"Krita 的“{_PAINTOP_NAMES.get(p.paintop, p.paintop)}”({p.paintop}) 引擎没有对应功能，"
                "已近似为普通笔刷。")
-        if p.paintop == "colorsmudge":
-            b.wet.enabled = True
-            b.wet.mix = _clamp(_float(pr.get("SmudgeRateValue"), 0.5))
-            b.wet.load = 1.0 - _clamp(_float(pr.get("ColorRateValue"), 0.0))
+    if p.paintop == "colorsmudge":
+        b.wet.enabled = True
+        b.wet.mix = _clamp(_float(pr.get("SmudgeRateValue"), 0.5))
+        # "Color Rate" = how much brush colour is laid down; unchecked means a pure blender
+        b.wet.load = _clamp(_float(pr.get("ColorRateValue"), 1.0)) if pr.get("PressureColorRate", "true") == "true" else 0.0
+        if pr.get("SmudgeRateMode") == "0":
+            b.wet.color_stretch, b.wet.mix = b.wet.mix, 0.0
 
     # -- tip ----------------------------------------------------------------------------------
     for res in p.resources:
@@ -993,7 +1000,8 @@ def brush_to_preset(b: Brush, prefix: str, used: set[str]) -> tuple[str, dict[st
     params = _base_params()
     types: dict[str, str] = {}
     native = b.source.native if b.source.format == "krita" else {}
-    if native.get("paintop") == "paintbrush" and isinstance(native.get("params"), dict):
+    if (native.get("paintop") == "paintbrush" or (native.get("paintop") == "colorsmudge" and b.wet.enabled)) \
+            and isinstance(native.get("params"), dict):
         for k, v in native["params"].items():
             if k.startswith(_UNMANAGED_SKIP_PREFIXES):
                 continue
@@ -1073,7 +1081,14 @@ def brush_to_preset(b: Brush, prefix: str, used: set[str]) -> tuple[str, dict[st
     if c.fg_bg_jitter > 0:
         b.warn("Krita 普通笔刷没有“前景/背景色抖动”，已忽略。")
     if b.wet.enabled:
-        b.warn("Krita 像素笔刷不支持混色，可在 Krita 中改用“涂抹笔刷”引擎。")
+        # Color Smudge engine; these keys are read identically by Krita 4.x and 5.x (legacy smudge engine).
+        w = b.wet
+        params["paintop"] = "colorsmudge"
+        params["SmudgeRateMode"] = "0" if w.color_stretch > w.mix else "1"
+        _write_option(params, "SmudgeRate", checked=True, use_curve=False, value=_clamp(max(w.mix, w.color_stretch)))
+        _write_option(params, "ColorRate", checked=w.load > 0, use_curve=False, value=_clamp(w.load))
+        _write_option(params, "SmudgeRadius", checked=False, use_curve=False, value=0.0)
+        params.update({"MergedPaint": "false", "ColorSmudgeOverlay": "false"})
     b.warn_extras("Krita")
     if b.stabilization > 0 or b.taper_start > 0 or b.taper_end > 0:
         b.warn("防抖/起笔收笔不属于 Krita 笔刷预设，请在 Krita 工具选项中设置。")
@@ -1225,7 +1240,7 @@ def write_bundle(brushes: list[Brush], out_path: Path, *, title: str = "", autho
             if path not in files:
                 files[path] = r.data
                 manifest.append((r.type, path, r.md5))
-        xml = build_preset_xml(b.name, params, types)
+        xml = build_preset_xml(b.name, params, types, paintop=params.get("paintop", "paintbrush"))
         kpp = encode_kpp(xml, _preset_preview(b), KPP_VERSION_K4)
         path = f"paintoppresets/{prefix}{stem}.kpp"
         files[path] = kpp
@@ -1252,7 +1267,7 @@ def write_kpp(b: Brush, out_path: Path, version: Optional[str] = None) -> Path:
         version = KPP_VERSION_K5 if any(r.type == "brushes" for r in resources) else KPP_VERSION_K4
     embedded = [EmbeddedResource(r.type, r.name if r.type == "patterns" else Path(r.filename).stem, r.filename,
                                  r.md5, r.data) for r in resources] if version == KPP_VERSION_K5 else []
-    xml = build_preset_xml(b.name, params, types, embedded)
+    xml = build_preset_xml(b.name, params, types, embedded, paintop=params.get("paintop", "paintbrush"))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(encode_kpp(xml, _preset_preview(b), version))
@@ -1434,13 +1449,20 @@ class KritaCodec(FormatCodec):
         ``kpp_version`` ("2.2" or "5.0") for standalone presets.
         """
         out_path = Path(out_path)
+        kv = options.get("kpp_version")
+        tv = str(options.get("krita_version") or options.get("target_version") or "")
+        if not kv and re.match(r"\s*[1-4]\b", tv):
+            kv = KPP_VERSION_K4
+            for b in brushes if out_path.suffix.lower() == ".kpp" else []:
+                if b.tips or b.texture is not None or b.dual is not None:
+                    b.warn("Krita 4 的单个 .kpp 预设无法内嵌笔尖/纹理图像，导入后可能显示为默认笔尖；建议改用 .bundle 资源包。")
         if out_path.suffix.lower() == ".kpp":
             if len(brushes) == 1:
-                return [write_kpp(brushes[0], out_path, options.get("kpp_version"))]
+                return [write_kpp(brushes[0], out_path, kv)]
             out = []
             for b in brushes:
                 target = unique_path(out_path.parent / (safe_filename(b.name) + ".kpp"))
-                out.append(write_kpp(b, target, options.get("kpp_version")))
+                out.append(write_kpp(b, target, kv))
             return out
         if out_path.suffix.lower() != ".bundle":
             out_path = out_path.with_suffix(".bundle")

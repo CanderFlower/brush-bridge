@@ -135,12 +135,14 @@ PLUGIN_MODULES = [
     "brush_bridge.formats.sai2",
     "brush_bridge.formats.krita",
     "brush_bridge.formats.gimp",
+    "brush_bridge.formats.mypaint",
     "brush_bridge.formats.images",
     "brush_bridge.apps.photoshop",
     "brush_bridge.apps.csp",
     "brush_bridge.apps.sai2",
     "brush_bridge.apps.krita",
     "brush_bridge.apps.gimp",
+    "brush_bridge.apps.mypaint",
     "brush_bridge.apps.procreate",
 ]
 
