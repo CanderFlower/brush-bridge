@@ -77,9 +77,10 @@ class ColorDynamics:
 
     ``*_jitter`` are random ranges (0..1, applied in both directions). ``*_pressure`` / ``*_tilt``
     are signed shifts (hue: 1.0 == 180 degrees; saturation and brightness: 1.0 == 100%) applied at
-    the lightest pressure / flattest tilt and fading to the chosen colour at full pressure / upright,
-    like Procreate "Color pressure" / "Color tilt". With a pressure curve ``c`` the shift at pressure
-    ``p`` is ``shift * (1 - c(p))``. They are always per tip.
+    the lightest pressure / flattest tilt and fading to the chosen colour at full pressure / upright.
+    With a pressure curve ``c`` the shift at pressure ``p`` is ``shift * (1 - c(p))``, so a shift that
+    grows with pressure uses the curve ``1 - p``. ``fg_bg_*`` mix towards the secondary colour (0..1).
+    They are always per tip.
     """
 
     fg_bg_jitter: float = 0.0
@@ -96,7 +97,10 @@ class ColorDynamics:
     hue_tilt: float = 0.0
     saturation_tilt: float = 0.0
     brightness_tilt: float = 0.0
-    pressure_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # "hue"/"saturation"/...
+    # 0..1 mix towards the secondary (background) colour at the lightest pressure / flattest tilt
+    fg_bg_pressure: float = 0.0
+    fg_bg_tilt: float = 0.0
+    pressure_curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # "hue"/.../"fg_bg"
 
     def has_jitter(self) -> bool:
         return any(v > 0 for v in (self.fg_bg_jitter, self.hue_jitter, self.saturation_jitter, self.brightness_jitter,
@@ -104,7 +108,8 @@ class ColorDynamics:
 
     def has_shift(self) -> bool:
         return any(abs(v) > 1e-4 for v in (self.hue_pressure, self.saturation_pressure, self.brightness_pressure,
-                                           self.hue_tilt, self.saturation_tilt, self.brightness_tilt))
+                                           self.hue_tilt, self.saturation_tilt, self.brightness_tilt,
+                                           self.fg_bg_pressure, self.fg_bg_tilt))
 
     def is_active(self) -> bool:
         return self.has_jitter() or self.has_shift()
@@ -205,7 +210,7 @@ class Brush:
         if self.edge.is_active() and not edge:
             self.warn(f"{app} 没有“边缘加深/湿边/灼边”效果，已忽略。")
         if self.color.has_shift() and not color_shift:
-            self.warn(f"{app} 不支持颜色随压力/倾斜变化（色相/饱和度/亮度），已忽略。")
+            self.warn(f"{app} 不支持颜色随压力/倾斜变化（色相/饱和度/亮度/辅助颜色），已忽略。")
 
     def main_tip(self) -> Image.Image:
         """First tip, or a rendered computed round tip."""

@@ -150,6 +150,31 @@ def test_edge_and_color_shift_columns(tmp_path):
     assert r.color.brightness_pressure < 0 and not r.color.pressure_curves
 
 
+def test_secondary_color_follows_tilt_and_pressure(tmp_path):
+    b = Brush(name="双色", size_px=40, color=ColorDynamics(fg_bg_tilt=1.0, per_tip=True))
+    v = _variant(CspCodec().write([b], tmp_path / "tilt.sut")[0])
+    assert v["BrushChangePatternColor"] == 1 and v["BrushSubColor"] == 100
+    assert decode_effector(v["BrushSubColorEffector"]).enabled & 0x20
+    r = CspCodec().read(tmp_path / "tilt.sut")[0]
+    assert r.color.fg_bg_tilt == pytest.approx(1.0) and r.color.fg_bg_jitter == 0
+
+    # heavier pressure -> more secondary colour (Procreate) == shift curve 1 - p in the neutral model
+    heavy = [(0.0, 1.0), (1.0, 0.0)]
+    b = Brush(name="压感副色", size_px=40,
+              color=ColorDynamics(fg_bg_pressure=0.4, per_tip=True, pressure_curves={"fg_bg": heavy}))
+    v = _variant(CspCodec().write([b], tmp_path / "pr.sut")[0])
+    e = decode_effector(v["BrushSubColorEffector"])
+    assert v["BrushSubColor"] == 40 and e.enabled & 0x10 and e.pressure_curve == [(0.0, 0.0), (1.0, 1.0)]
+    r = CspCodec().read(tmp_path / "pr.sut")[0]
+    assert r.color.fg_bg_pressure == pytest.approx(0.4) and r.color.pressure_curves["fg_bg"] == heavy
+
+
+def test_brush_size_clamped_to_csp_limit(tmp_path):
+    b = Brush(name="巨大", size_px=6000)
+    v = _variant(CspCodec().write([b], tmp_path / "big.sut")[0])
+    assert v["BrushSize"] == 2000 and any("上限" in n for n in b.notes)
+
+
 def test_spray_area_and_particle_semantics(tmp_path):
     # Procreate-style "2 tips per dab, no positional jitter" must not become a sparse spray
     b = Brush(name="双印", size_px=43.4, spacing=0.07, count=2, angle_jitter=1.0)

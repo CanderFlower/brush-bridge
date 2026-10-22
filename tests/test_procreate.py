@@ -319,6 +319,61 @@ def test_effects_mapping_roundtrip():
         assert q[k] == pytest.approx(p[k], abs=1e-6), k
 
 
+def test_secondary_color_and_heavy_pressure_hue():
+    p = pc.template_params("双色")
+    p.update({"dynamicsTiltSecondaryColor": 1.0, "dynamicsPressureHue": 0.05,
+              "dynamicsPressureSecondaryColor": 0.0})
+    b = pc.params_to_brush(p, shape=None, grain=None, thumb=None)
+    # tilt mixes in the secondary colour; hue shifts with heavier pressure (inverted neutral curve)
+    assert b.color.fg_bg_tilt == pytest.approx(1.0) and b.color.fg_bg_pressure == 0
+    assert b.color.hue_pressure == pytest.approx(0.1)
+    assert b.color.pressure_curves["hue"] == [(0.0, 1.0), (1.0, 0.0)]
+    assert any("辅助颜色" in n for n in b.notes)
+    q = pc.brush_to_params(b, has_grain=False)
+    assert q["dynamicsTiltSecondaryColor"] == pytest.approx(1.0)
+    assert q["dynamicsPressureHue"] == pytest.approx(0.05)
+    assert pc._curve(q, "dynamicsPressureHueCurve") == []  # back to Procreate's identity curve
+
+
+def test_combined_brush_becomes_dual_tip(tmp_path):
+    main = pc.template_params("组合")
+    main["dualBlendMode"] = 6  # difference
+    sub = pc.template_params("副笔刷")
+    sub["bundledShapePath"] = None
+    p = tmp_path / "combo.brushset"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("A/Brush.archive", pc.archive(main))
+        zf.writestr("A/Reset/Brush.archive", pc.archive(main))
+        zf.writestr("A/Sub01/Brush.archive", pc.archive(sub))
+        zf.writestr("A/Reset/Sub01/Brush.archive", pc.archive(sub))
+        buf = __import__("io").BytesIO()
+        _tip(64, 64).save(buf, "PNG")
+        zf.writestr("A/Sub01/Shape.png", buf.getvalue())
+        zf.writestr("Brushset.plist", plistlib.dumps({"name": "组合集", "brushes": ["A"]}))
+    brushes = codec("procreate").read(p)
+    assert len(brushes) == 1  # Sub01 / Reset are parts of the brush, not extra brushes
+    b = brushes[0]
+    assert b.dual is not None and b.dual.mode == "difference" and b.dual.image.size == (64, 64)
+    assert "Sub01/Brush.archive" in b.source.native["files"]
+
+
+def test_builtin_asset_approximations():
+    from brush_bridge.formats.procreate_builtin import builtin_grain, builtin_shape
+
+    g = np.asarray(builtin_grain("Distressed-Canvas-3.jpg"), dtype=np.float32)
+    assert g.shape == (512, 512) and g.std() > 10
+    seam = np.abs(g[:, 0] - g[:, -1]).mean()
+    assert seam < np.abs(np.diff(g, axis=1)).mean() * 3 + 1  # tiles seamlessly
+    assert builtin_grain("Brush-Artery-Rust-1.jpg").tobytes() == builtin_grain("Brush-Artery-Rust-1.jpg").tobytes()
+    leaf = builtin_shape("Simple-Leaf.png")
+    assert leaf is not None and leaf.mode == "L" and 0 < np.asarray(leaf).mean() < 255
+    assert builtin_shape("Totally-Unknown.png") is None
+    p = pc.template_params("内置")
+    p["bundledShapePath"] = "Brush-Preset-Flat-Brush2.jpg"
+    b = pc.params_to_brush(p, shape=None, grain=None, thumb=None)
+    assert len(b.tips) == 1 and any("近似图像" in n for n in b.notes)
+
+
 def test_unsupported_features_warn():
     b = _brush(tips=[_tip(), _tip(40, 40)], roundness_jitter=0.3, is_eraser=True,
                blend_mode="hue_shift_of_doom")
@@ -348,7 +403,8 @@ def test_bundled_assets_reported(tmp_path):
     assert info is not None and info.format_id == "procreate"
     assert len(info.problems) == 2
     b = codec("procreate").read(p)[0]
-    assert b.tips == [] and b.texture is None
+    assert b.tips == []  # unknown shape name -> computed round tip
+    assert b.texture is not None and b.texture.image.size == (512, 512)  # generic procedural grain
     assert len(b.notes) >= 2
     # a write without original files falls back to a synthesized round shape
     out = codec("procreate").write([b], tmp_path / "out.brush")[0]

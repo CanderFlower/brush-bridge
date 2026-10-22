@@ -43,6 +43,7 @@ TEXTURE_MODES = {0: "multiply", 1: "subtract"}
 TEXTURE_MODE_IDS = {v: k for k, v in TEXTURE_MODES.items()}
 # DualBrushCompositeMode uses the CompositeMode list.
 MAX_GENERATED_TIPS = 16
+MAX_BRUSH_SIZE_PX = 2000  # largest value of CSP's brush size slider
 
 # Length units used by BrushSizeUnit / BrushInLengthUnit / ...: 0 px, 1 cm, 2 mm, 3 inch, 4 pt.
 # Physical units are converted at 350 dpi (CSP's default canvas resolution for illustrations).
@@ -270,7 +271,14 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
 
     # Colour jitter ("色の揺らぎ"); per-tip channels may also follow pressure / tilt
     if int(v.get("BrushChangePatternColor") or 0):
-        col = ColorDynamics(fg_bg_jitter=_clamp(_num(v.get("BrushSubColor")) / 100), per_tip=True)
+        col = ColorDynamics(per_tip=True)
+        down, up, shift, source, curve = read_color_channel(_num(v.get("BrushSubColor")) / 100,
+                                                            v.get("BrushSubColorEffector"))
+        col.fg_bg_jitter = _clamp(max(down, up))
+        if source:
+            setattr(col, f"fg_bg_{source}", _clamp(shift))
+            if curve:
+                col.pressure_curves["fg_bg"] = curve
         for ch, stem, unit in _COLOR_CHANNELS:
             down, up, shift, source, curve = read_color_channel(
                 _num(v.get(f"Brush{stem}Change")) / unit, v.get(f"Brush{stem}ChangeEffector"))
@@ -289,7 +297,7 @@ def variant_to_brush(v: dict, node: dict, resolve: ImageResolver, name: str = ""
             hue_jitter=_clamp(abs(_num(v.get("BrushStrokeHueChange"))) / 180),
             saturation_jitter=_clamp(abs(_num(v.get("BrushStrokeSaturationChange"))) / 100),
             brightness_jitter=_clamp(abs(_num(v.get("BrushStrokeValueChange"))) / 100), per_tip=False)
-        for ch, _stem, _unit in _COLOR_CHANNELS:  # keep the per-tip pressure / tilt shifts
+        for ch in [c[0] for c in _COLOR_CHANNELS] + ["fg_bg"]:  # keep the per-tip pressure / tilt shifts
             for src in ("pressure", "tilt"):
                 setattr(stroke, f"{ch}_{src}", getattr(b.color, f"{ch}_{src}"))
         stroke.pressure_curves = dict(b.color.pressure_curves)
@@ -347,6 +355,9 @@ def brush_columns(b: Brush) -> dict[str, object]:
     comp = COMPOSITE_ERASER if b.is_eraser else BLEND_TO_COMPOSITE.get(b.blend_mode, 0)
     rot = ROT_BASE | (ROT_DIRECTION if b.angle_follow_stroke else 0) | (ROT_RANDOM if b.angle_jitter > 0 else 0)
     spray, area, particle_pct, interval = spray_layout(b.size_px, b.spacing, b.scatter, b.count)
+    if area > MAX_BRUSH_SIZE_PX:
+        b.warn(f"笔刷尺寸约 {int(area)} px，超过 Clip Studio Paint 的上限 {MAX_BRUSH_SIZE_PX} px，已设为上限。")
+        area = MAX_BRUSH_SIZE_PX
     if not spray and b.count > 1:
         how = "提高流量" if b.spacing >= STAMP_SPACING else "更密的间隔"
         b.warn(f"每次落笔 {b.count} 个笔尖且没有位置散布，Clip Studio Paint 中已改为用{how}来近似叠加效果。")
@@ -419,9 +430,17 @@ def brush_columns(b: Brush) -> dict[str, object]:
             amount, eff = color_channel(down, up, shift, source, col.pressure_curves.get(ch))
             c[f"Brush{stem}Change"] = int(round(max(-1.0, min(1.0, amount)) * unit))
             c[f"Brush{stem}ChangeEffector"] = eff
-        sub = _clamp(col.fg_bg_jitter) if tip_jitter else 0.0
-        c["BrushSubColor"] = int(round(sub * 100))
-        c["BrushSubColorEffector"] = encode_effector(jitter=1.0) if sub > 0 else encode_effector()
+        jit = _clamp(col.fg_bg_jitter) if tip_jitter else 0.0
+        sp, st = _clamp(col.fg_bg_pressure), _clamp(col.fg_bg_tilt)
+        source, shift = ("pressure", sp) if sp >= st else ("tilt", st)
+        if shift < 1e-4:
+            source, shift = "", 0.0
+        elif sp > 1e-4 and st > 1e-4:
+            b.warn("Clip Studio Paint 的副色混合只能跟随一种输入，已只保留"
+                   f"{'压力' if source == 'pressure' else '倾斜'}的影响。")
+        amount, eff = color_channel(0.0, jit, shift, source, col.pressure_curves.get("fg_bg"))
+        c["BrushSubColor"] = int(round(_clamp(amount) * 100))
+        c["BrushSubColorEffector"] = eff
     if stroke_jitter:
         c.update({"BrushStrokeHueChange": int(round(_clamp(col.hue_jitter) * 180)),
                   "BrushStrokeSaturationChange": int(round(_clamp(col.saturation_jitter) * 100)),
@@ -447,7 +466,7 @@ def brush_columns(b: Brush) -> dict[str, object]:
     if d is not None:
         dspray, darea, dpct, dint = spray_layout(max(1.0, d.size_px), d.spacing, d.scatter, d.count)
         c.update({"DualBrushCompositeMode": BLEND_TO_COMPOSITE.get(d.mode, 2), "SyncDualBrushSize": 0,
-                  "DualSize": round(max(1.0, darea), 2), "DualSizeUnit": 0,
+                  "DualSize": round(min(max(1.0, darea), MAX_BRUSH_SIZE_PX), 2), "DualSizeUnit": 0,
                   "DualInterval": dint, "DualAutoIntervalType": 0,
                   "DualUseSpray": int(dspray), "DualSprayDensity": max(1, int(d.count)),
                   "DualSpraySize": dpct, "DualSpraySizeUnit": 0, "DualSpraySizeSyncBrushSize": 1})

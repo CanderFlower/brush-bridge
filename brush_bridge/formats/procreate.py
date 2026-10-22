@@ -11,7 +11,10 @@ File layout (both are plain zip archives):
 
 When ``bundledShapePath`` / ``bundledGrainPath`` name a file (e.g. ``Brush-Preset-Hard.png``) the
 brush uses an image that ships inside Procreate itself; those images are not in the file and
-cannot be redistributed, so we approximate the shape with a computed round tip.
+cannot be redistributed, so we substitute procedurally generated look-alikes
+(``procreate_builtin``) or, for unknown shapes, a computed round tip.
+
+Combined brushes keep their second brush in ``<uuid>/Sub01/``; it is read as a dual tip.
 
 Format knowledge comes from studying public brushes and these open-source projects (no code
 copied): aumlette-lab/procreate-brush-decoder (MIT, parameter ranges and GUI formulas),
@@ -35,14 +38,20 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from ..core.imaging import pad_square, round_tip, stroke_preview
-from ..core.model import Brush, BrushRef, BrushSource, ColorDynamics, Dynamic, EdgeEffect, Texture, WetMix
+from ..core.model import (Brush, BrushRef, BrushSource, ColorDynamics, DualTip, Dynamic, EdgeEffect, Texture,
+                          WetMix)
 from ..core.plugin import FileInfo, FormatCodec, register_codec
+from .procreate_builtin import builtin_grain, builtin_shape
 
 log = logging.getLogger(__name__)
 
 ARCHIVE = "Brush.archive"
 SHAPE = "Shape.png"
 GRAIN = "Grain.png"
+SUB_DIR = "Sub01/"  # second brush of a combined brush (Procreate 5)
+SUB_ARCHIVE = SUB_DIR + "Brush.archive"
+# Combined-brush blend modes kept as such for the dual tip; the rest act like a mask (multiply).
+_DUAL_MODES = {"multiply": "multiply", "darken": "darken", "subtract": "subtract", "difference": "difference"}
 THUMB = "QuickLook/Thumbnail.png"
 BRUSHSET_PLIST = "brushset.plist"
 
@@ -435,6 +444,15 @@ def _curve(p: dict, key: str) -> list[tuple[float, float]]:
     return out
 
 
+_HEAVY_PRESSURE_COLOR = ("hue", "fg_bg")  # Procreate colour channels that shift with heavier pressure
+
+
+def _flip_curve(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """``1 - c(p)``; [] when the result is the identity line."""
+    out = [(float(x), _clamp(1.0 - float(y))) for x, y in (pts or [(0.0, 0.0), (1.0, 1.0)])]
+    return [] if all(abs(x - y) < 1e-3 for x, y in out) else out
+
+
 def _set_curve(p: dict, key: str, pts: list[tuple[float, float]]) -> None:
     if pts and len(pts) >= 2:
         p[key] = {"$class": "ValkyrieMagnitudinalCurve", "points": [(float(x), float(y)) for x, y in pts]}
@@ -479,8 +497,9 @@ def _list_entries(zf: zipfile.ZipFile) -> tuple[list[_Entry], str]:
     for n in names:
         if n == ARCHIVE or n.endswith("/" + ARCHIVE):
             pre = n[: -len(ARCHIVE)]
-            if pre.rstrip("/").split("/")[-1] == "Reset":
-                continue
+            segs = pre.rstrip("/").split("/")
+            if "Reset" in segs or (segs and re.fullmatch(r"Sub\d+", segs[-1])):
+                continue  # factory-reset copy / second brush of a combined brush
             prefixes.append(pre)
     set_name = ""
     order: list[str] = []
@@ -595,7 +614,13 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
         br.tips = [tip]
     else:
         hint = _bundled_shape_hint(bundled_shape) if bundled_shape else (1.0, 1.0)
-        if hint is None:
+        approx = builtin_shape(bundled_shape) if hint is None else None
+        if approx is not None:
+            br.tips = [approx]
+            br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，文件中不包含该图像，"
+                    "已用程序生成的同类近似图像代替。")
+            hint = (1.0, 1.0)
+        elif hint is None:
             br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，文件中不包含该图像，已用圆形笔尖代替。")
             hint = (0.8, 1.0)
         elif bundled_shape:
@@ -685,6 +710,10 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
 
     # --- grain --------------------------------------------------------------------------------
     bundled_grain = p.get("bundledGrainPath") if isinstance(p.get("bundledGrainPath"), str) else ""
+    if grain is None and bundled_grain and bundled_grain != BLANK_GRAIN:
+        grain = builtin_grain(bundled_grain)
+        br.warn(f"该笔刷使用了 Procreate 内置纹理「{bundled_grain}」，文件中不包含该图像，"
+                "已用程序生成的同类近似纹理代替。")
     if grain is not None:
         gimg = _gray_white_paint(grain)
         gmode = int(_f(p, "grainBlendMode", 1))
@@ -697,8 +726,6 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
             contrast=_clamp(_f(p, "textureContrast"), -1.0, 1.0),
             per_tip=int(_f(p, "textureApplication")) == 0 and _f(p, "textureMovement") < 0.5,
             depth_dynamic=Dynamic(jitter=_clamp(_f(p, "grainDepthJitter"))))
-    elif bundled_grain and bundled_grain != BLANK_GRAIN:
-        br.warn(f"该笔刷使用了 Procreate 内置纹理「{bundled_grain}」，文件中不包含该图像，纹理已丢失。")
 
     # --- colour / wet mix ---------------------------------------------------------------------
     light, dark = _clamp(_f(p, "dynamicsJitterLightness")), _clamp(_f(p, "dynamicsJitterDarkness"))
@@ -718,16 +745,25 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
     br.color = stamp if stamp.is_active() or not stroke.is_active() else stroke
     if stamp.is_active() and stroke.is_active():
         br.warn("Procreate 同时设置了“图章颜色抖动”和“笔画颜色抖动”，只保留了图章颜色抖动。")
-    # Colour driven by pressure / tilt. Procreate shifts the colour at light pressure and reaches the
-    # chosen colour at full pressure: saturation 100% = white -> saturated, brightness 100% = lighter
-    # at light pressure, hue 100% = the whole spectrum (360 degrees).
+    # Colour driven by pressure / tilt. Saturation 100% = white -> saturated and brightness 100% = lighter
+    # at light pressure; hue (100% = the whole 360 degree spectrum) and the secondary colour keep the
+    # chosen colour at light pressure and shift as the pressure increases. The neutral model stores
+    # shifts at light pressure, so those two get an inverted pressure curve.
     for ch, label, sign, scale in (("hue", "Hue", 1.0, 2.0), ("saturation", "Saturation", -1.0, 1.0),
-                                   ("brightness", "Brightness", 1.0, 1.0)):
+                                   ("brightness", "Brightness", 1.0, 1.0), ("fg_bg", "SecondaryColor", 1.0, 1.0)):
         setattr(br.color, f"{ch}_pressure", _clamp(sign * scale * _f(p, f"dynamicsPressure{label}"), -1.0, 1.0))
         setattr(br.color, f"{ch}_tilt", _clamp(sign * scale * _f(p, f"dynamicsTilt{label}"), -1.0, 1.0))
         cv = _curve(p, f"dynamicsPressure{label}Curve")
+        if ch in _HEAVY_PRESSURE_COLOR and abs(getattr(br.color, f"{ch}_pressure")) > 1e-4:
+            cv = _flip_curve(cv)
         if cv:
             br.color.pressure_curves[ch] = cv
+    if br.color.fg_bg_pressure > 1e-4 or br.color.fg_bg_tilt > 1e-4:
+        br.warn("该笔刷会随压力/倾斜混入“辅助颜色”（Procreate 颜色面板右上角第二个色块），"
+                "在目标软件中请同时设置主色和副色（背景色）。")
+    if abs(_f(p, "dynamicsRollSecondaryColor")) > 1e-3 or any(
+            abs(_f(p, f"dynamicsRoll{lb}")) > 1e-3 for lb in ("Hue", "Saturation", "Brightness")):
+        br.warn("Procreate 的“桶形旋转（Apple Pencil Pro）改变颜色”无法转换，已忽略。")
 
     dilution = _clamp(_f(p, "dynamicsMix"))
     recursive = bool(p.get("renderingRecursiveMixing"))
@@ -868,12 +904,18 @@ def brush_to_params(br: Brush, *, has_grain: bool) -> dict[str, Any]:
         _set(p, pre_d, _clamp(c.brightness_jitter if c.brightness_down is None else c.brightness_down))
         _set(p, sec, _clamp(c.fg_bg_jitter))
     for ch, label, sign, scale in (("hue", "Hue", 1.0, 2.0), ("saturation", "Saturation", -1.0, 1.0),
-                                   ("brightness", "Brightness", 1.0, 1.0)):
-        _set(p, f"dynamicsPressure{label}", _clamp(sign * getattr(c, f"{ch}_pressure") / scale, -1.0, 1.0))
-        _set(p, f"dynamicsTilt{label}", _clamp(sign * getattr(c, f"{ch}_tilt") / scale, -1.0, 1.0))
-        _set_curve(p, f"dynamicsPressure{label}Curve", c.pressure_curves.get(ch, []))
-    if any(abs(getattr(c, f"{ch}_tilt")) > 1e-4 for ch in ("hue", "saturation", "brightness")):
+                                   ("brightness", "Brightness", 1.0, 1.0), ("fg_bg", "SecondaryColor", 1.0, 1.0)):
+        lo = 0.0 if ch == "fg_bg" else -1.0
+        _set(p, f"dynamicsPressure{label}", _clamp(sign * getattr(c, f"{ch}_pressure") / scale, lo, 1.0))
+        _set(p, f"dynamicsTilt{label}", _clamp(sign * getattr(c, f"{ch}_tilt") / scale, lo, 1.0))
+        cv = c.pressure_curves.get(ch, [])
+        if ch in _HEAVY_PRESSURE_COLOR and abs(getattr(c, f"{ch}_pressure")) > 1e-4:
+            cv = _flip_curve(cv)
+        _set_curve(p, f"dynamicsPressure{label}Curve", cv)
+    if any(abs(getattr(c, f"{ch}_tilt")) > 1e-4 for ch in ("hue", "saturation", "brightness", "fg_bg")):
         _set(p, "dynamicsTiltAngle", 0.5)
+        if c.fg_bg_tilt > 1e-4:
+            _set(p, "secondaryColorTiltAngle", 0.0)
 
     if br.wet.enabled:
         _set(p, "renderingRecursiveMixing", True)
@@ -1035,6 +1077,26 @@ def write_procreate(brushes: list[Brush], out_path: Path, *, set_name: str = "",
 # ---------------------------------------------------------------------------------------------
 # Codec
 # ---------------------------------------------------------------------------------------------
+def _attach_combined(zf: zipfile.ZipFile, e: _Entry, names: set[str], params: dict[str, Any], br: Brush) -> None:
+    """Procreate "combined" brush (second brush in ``Sub01/``) -> dual tip."""
+    sub_pre = e.prefix + SUB_DIR
+    try:
+        sp, _chains = unarchive(zf.read(e.prefix + SUB_ARCHIVE))
+    except Exception:  # noqa: BLE001
+        br.warn("该笔刷是 Procreate 组合笔刷，但第二个笔刷无法读取，已只转换主笔刷。")
+        return
+    if not isinstance(sp, dict):
+        return
+    sub = params_to_brush(
+        sp, shape=_read_png(zf, sub_pre + SHAPE) if sub_pre + SHAPE in names else None,
+        grain=_read_png(zf, sub_pre + GRAIN) if sub_pre + GRAIN in names else None, thumb=None)
+    mode = _BLEND_BY_MODE.get(int(_f(params, "dualBlendMode", 1)), "multiply")
+    br.dual = DualTip(image=sub.main_tip(), size_px=sub.size_px, spacing=sub.spacing, scatter=sub.scatter,
+                      count=sub.count, mode=_DUAL_MODES.get(mode, "multiply"), name=sub.name or "Sub01")
+    br.warn(f"该笔刷是 Procreate 组合笔刷（组合模式：{mode}），第二个笔刷已转换为“双重笔刷/2 号笔尖”，"
+            "其纹理、动态和颜色设置无法保留，效果为近似。")
+
+
 def _load_entry(zf: zipfile.ZipFile, e: _Entry, path: Path, set_name: str) -> Brush:
     data, params, chains = _read_archive(zf, e)
     names = set(zf.namelist())
@@ -1042,6 +1104,8 @@ def _load_entry(zf: zipfile.ZipFile, e: _Entry, path: Path, set_name: str) -> Br
     grain = _read_png(zf, e.prefix + GRAIN) if e.prefix + GRAIN in names else None
     thumb = _read_png(zf, e.prefix + THUMB) if e.prefix + THUMB in names else None
     br = params_to_brush(params, shape=shape, grain=grain, thumb=thumb)
+    if e.prefix + SUB_ARCHIVE in names:
+        _attach_combined(zf, e, names, params, br)
     br.group = set_name
     files = {}
     for n in zf.namelist():
@@ -1121,11 +1185,11 @@ class ProcreateCodec(FormatCodec):
             if missing_shapes:
                 info.problems.append(
                     f"笔刷 {listing(missing_shapes)} 使用 Procreate 内置形状，文件里没有该图像（属于 Procreate 的"
-                    f"版权素材，无法附带）。转换到其他软件时将用圆形笔尖代替。")
+                    f"版权素材，无法附带）。转换到其他软件时将用程序生成的近似形状或圆形笔尖代替。")
             if missing_grains:
                 info.problems.append(
                     f"笔刷 {listing(missing_grains)} 使用 Procreate 内置纹理，文件里没有该图像。"
-                    f"转换到其他软件时纹理会丢失。")
+                    f"转换到其他软件时将用程序生成的同类近似纹理代替。")
             if broken:
                 info.problems.append(f"有 {broken} 个笔刷的参数文件已损坏，无法读取。")
             return info
