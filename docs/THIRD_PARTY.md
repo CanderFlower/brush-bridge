@@ -33,7 +33,9 @@ used only by `tests/test_procreate.py`. Each download is pinned to a commit.
 
 Procreate is a trademark of Savage Interactive Pty Ltd. brush-bridge is not
 affiliated with Savage Interactive. Procreate's built-in shapes and grains are not
-distributed; brushes that reference them fall back to a computed round tip.
+distributed. Brushes that reference them use images the user places in their own
+`procreate_library` folder; otherwise they fall back to procedurally generated look-alikes
+(`brush_bridge/formats/procreate_builtin.py`) or a computed round tip.
 
 ## Clip Studio Paint support (`brush_bridge/formats/csp*.py`, `brush_bridge/apps/csp.py`)
 

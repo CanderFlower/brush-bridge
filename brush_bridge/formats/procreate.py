@@ -11,8 +11,8 @@ File layout (both are plain zip archives):
 
 When ``bundledShapePath`` / ``bundledGrainPath`` name a file (e.g. ``Brush-Preset-Hard.png``) the
 brush uses an image that ships inside Procreate itself; those images are not in the file and
-cannot be redistributed, so we substitute procedurally generated look-alikes
-(``procreate_builtin``) or, for unknown shapes, a computed round tip.
+cannot be redistributed, so we use the user's own copy from the ``procreate_library`` folder when
+present, else procedurally generated look-alikes (``procreate_builtin``) or a computed round tip.
 
 Combined brushes keep their second brush in ``<uuid>/Sub01/``; it is read as a dual tip.
 
@@ -41,7 +41,7 @@ from ..core.imaging import pad_square, round_tip, stroke_preview
 from ..core.model import (Brush, BrushRef, BrushSource, ColorDynamics, DualTip, Dynamic, EdgeEffect, Texture,
                           WetMix)
 from ..core.plugin import FileInfo, FormatCodec, register_codec
-from .procreate_builtin import builtin_grain, builtin_shape
+from .procreate_builtin import builtin_grain, builtin_shape, default_library_dir, library_has, library_image
 
 log = logging.getLogger(__name__)
 
@@ -400,9 +400,14 @@ _BUNDLED_SHAPE_HINTS = (
 )
 
 
+_LIBRARY_TIP = f"（如有该素材原图，可放入「{default_library_dir()}」文件夹后重新转换，即可使用原图。）"
+
+
 def _bundled_shape_hint(path: str) -> Optional[tuple[float, float]]:
     low = path.lower()
     if not low.startswith("brush-") and "preset" not in low:
+        return None
+    if any(k in low for k in ("dots", "splatter", "spark", "spray")):
         return None
     for key, val in _BUNDLED_SHAPE_HINTS:
         if key in low:
@@ -607,21 +612,25 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
 
     # --- tip ----------------------------------------------------------------------------------
     bundled_shape = p.get("bundledShapePath") if isinstance(p.get("bundledShapePath"), str) else ""
+    hint = _bundled_shape_hint(bundled_shape) if bundled_shape else None
+    if shape is None and bundled_shape:
+        shape = library_image(bundled_shape)
     if shape is not None:
         tip = _gray_white_paint(shape)
         if p.get("shapeInverted"):
             tip = ImageOps.invert(tip)
         br.tips = [tip]
     else:
-        hint = _bundled_shape_hint(bundled_shape) if bundled_shape else (1.0, 1.0)
+        hint = hint if bundled_shape else (1.0, 1.0)
         approx = builtin_shape(bundled_shape) if hint is None else None
         if approx is not None:
             br.tips = [approx]
             br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，文件中不包含该图像，"
-                    "已用程序生成的同类近似图像代替。")
+                    f"已用程序生成的同类近似图像代替。{_LIBRARY_TIP}")
             hint = (1.0, 1.0)
         elif hint is None:
-            br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，文件中不包含该图像，已用圆形笔尖代替。")
+            br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，文件中不包含该图像，已用圆形笔尖代替。"
+                    f"{_LIBRARY_TIP}")
             hint = (0.8, 1.0)
         elif bundled_shape:
             br.warn(f"该笔刷使用了 Procreate 内置形状「{bundled_shape}」，已用近似的圆形笔尖代替。")
@@ -711,9 +720,11 @@ def params_to_brush(p: dict[str, Any], *, shape: Optional[Image.Image], grain: O
     # --- grain --------------------------------------------------------------------------------
     bundled_grain = p.get("bundledGrainPath") if isinstance(p.get("bundledGrainPath"), str) else ""
     if grain is None and bundled_grain and bundled_grain != BLANK_GRAIN:
-        grain = builtin_grain(bundled_grain)
-        br.warn(f"该笔刷使用了 Procreate 内置纹理「{bundled_grain}」，文件中不包含该图像，"
-                "已用程序生成的同类近似纹理代替。")
+        grain = library_image(bundled_grain)
+        if grain is None:
+            grain = builtin_grain(bundled_grain)
+            br.warn(f"该笔刷使用了 Procreate 内置纹理「{bundled_grain}」，文件中不包含该图像，"
+                    f"已用程序生成的同类近似纹理代替。{_LIBRARY_TIP}")
     if grain is not None:
         gimg = _gray_white_paint(grain)
         gmode = int(_f(p, "grainBlendMode", 1))
@@ -1168,9 +1179,10 @@ class ProcreateCodec(FormatCodec):
                 archive_versions.add(str(params.get("version", "?")))
                 bname = params.get("name") if isinstance(params.get("name"), str) else e.prefix.strip("/")
                 bs, bg = params.get("bundledShapePath"), params.get("bundledGrainPath")
-                if isinstance(bs, str) and e.prefix + SHAPE not in names:
+                if isinstance(bs, str) and e.prefix + SHAPE not in names and not library_has(bs):
                     missing_shapes.append(f"{bname}（{bs}）")
-                if isinstance(bg, str) and bg != BLANK_GRAIN and e.prefix + GRAIN not in names:
+                if (isinstance(bg, str) and bg != BLANK_GRAIN and e.prefix + GRAIN not in names
+                        and not library_has(bg)):
                     missing_grains.append(f"{bname}（{bg}）")
             if versions:
                 rank = ["?", "4", "5", "5.2+", "5.4+"]
@@ -1185,11 +1197,11 @@ class ProcreateCodec(FormatCodec):
             if missing_shapes:
                 info.problems.append(
                     f"笔刷 {listing(missing_shapes)} 使用 Procreate 内置形状，文件里没有该图像（属于 Procreate 的"
-                    f"版权素材，无法附带）。转换到其他软件时将用程序生成的近似形状或圆形笔尖代替。")
+                    f"版权素材，无法附带）。转换到其他软件时将用程序生成的近似形状或圆形笔尖代替。{_LIBRARY_TIP}")
             if missing_grains:
                 info.problems.append(
                     f"笔刷 {listing(missing_grains)} 使用 Procreate 内置纹理，文件里没有该图像。"
-                    f"转换到其他软件时将用程序生成的同类近似纹理代替。")
+                    f"转换到其他软件时将用程序生成的同类近似纹理代替。{_LIBRARY_TIP}")
             if broken:
                 info.problems.append(f"有 {broken} 个笔刷的参数文件已损坏，无法读取。")
             return info

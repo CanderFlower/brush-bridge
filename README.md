@@ -64,6 +64,10 @@
 - *CSP 提示「此文件无法添加到工具组面板」*：要把 .abr / .sut 拖到 **辅助工具** 面板，而不是工具面板。
 - *CSP 提示无法读取 .abr*：多半是新版 Photoshop 的 v10 格式。到「🔧 修复导入问题」页拖入文件，点「转换为通用的 v6.2 格式」。
 - *直接写入软件设置会不会弄坏？* 写入前会自动备份到同目录的 `brush-bridge-backups` 文件夹，并要求先关闭目标软件。
+- *Procreate 笔刷提示「使用了 Procreate 内置纹理/形状」*：这类笔刷引用的是 Procreate 自带素材库里的图片，笔刷文件里没有。
+  把这些原图（文件名如 `Acrylic-Mix.jpg`、`Brush-Preset-Ink.jpg`）放进 `%LOCALAPPDATA%\BrushBridge\procreate_library`
+  文件夹（可含子文件夹），重新转换即可使用原图；没有原图时会用程序生成的同类纹理近似代替。
+  这些素材的版权属于 Procreate，本项目不附带。
 
 ## 从源码运行 / 开发
 
@@ -99,5 +103,6 @@ Photoshop、Clip Studio Paint、Procreate、PaintTool SAI、Krita、GIMP、MyPai
 - Writes files for a chosen target app version (e.g. CSP 1.x / 2.x–5.x, Krita 4 / 5, MyPaint v2 / v3).
 - One-click conversion + installation into the target app (with automatic backups when writing app settings).
 - Diagnoses files that an app refuses to import and repairs them (e.g. Photoshop 2020+ ABR v10 → v6.2 for Clip Studio Paint).
+- Procreate brushes that reference Procreate's built-in library use your own copies of those images from `%LOCALAPPDATA%\BrushBridge\procreate_library` (not shipped; procedural look-alikes otherwise).
 
 Download `BrushBridge.exe` from Releases, or run from source with `pip install -e .` then `brush-bridge`. MIT licensed.

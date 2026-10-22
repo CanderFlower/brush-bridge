@@ -12,3 +12,4 @@ tests/fixtures/downloaded/
 packaging/launcher.py
 tests/local_*
 *.log
+procreate_library/

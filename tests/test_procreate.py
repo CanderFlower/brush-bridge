@@ -374,6 +374,26 @@ def test_builtin_asset_approximations():
     assert len(b.tips) == 1 and any("近似图像" in n for n in b.notes)
 
 
+def test_user_library_supplies_builtin_images(tmp_path, monkeypatch):
+    from brush_bridge.formats import procreate_builtin
+
+    lib = tmp_path / "lib" / "Images"
+    lib.mkdir(parents=True)
+    leaf = Image.new("L", (64, 64), 0)
+    leaf.paste(255, (16, 8, 48, 56))
+    leaf.save(lib / "Simple-Leaf.png")
+    Image.new("L", (32, 32), 77).save(lib / "Acrylic-Mix.jpg")
+    monkeypatch.setenv(procreate_builtin.LIBRARY_ENV, str(tmp_path / "lib"))
+    p = pc.template_params("素材库")
+    p["bundledShapePath"] = "Simple-Leaf.png"
+    p["bundledGrainPath"] = "Acrylic-Mix.jpg"
+    b = pc.params_to_brush(p, shape=None, grain=None, thumb=None)
+    assert b.tips[0].size == (64, 64) and np.asarray(b.tips[0])[30, 30] == 255
+    assert b.texture is not None and abs(float(np.asarray(b.texture.image).mean()) - 77) < 3
+    assert not any("内置" in n for n in b.notes)
+    assert procreate_builtin.library_has("Acrylic-Mix") and not procreate_builtin.library_has("Nope.jpg")
+
+
 def test_unsupported_features_warn():
     b = _brush(tips=[_tip(), _tip(40, 40)], roundness_jitter=0.3, is_eraser=True,
                blend_mode="hue_shift_of_doom")

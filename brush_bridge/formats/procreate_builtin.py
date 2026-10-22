@@ -5,11 +5,19 @@ the image itself, and those images cannot be redistributed. To keep the characte
 converting, we synthesise an image of the same kind from keywords in the file name: canvas weave,
 mottled acrylic, rust blotches, splatters, charcoal grain, wood, flat bristle stamps, leaves, ink blots…
 All images are white = paint (``L`` mode); grains tile seamlessly.
+
+Users who have the original images (e.g. exported from their own Procreate) can drop them into a
+"Procreate library" folder; :func:`library_image` finds them by file name and they are used instead.
+Searched folders: ``$BRUSH_BRIDGE_PROCREATE_LIBRARY`` (``os.pathsep``-separated),
+``%LOCALAPPDATA%\\BrushBridge\\procreate_library`` and ``procreate_library`` next to the program.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -17,6 +25,69 @@ from PIL import Image, ImageFilter
 
 SHAPE_SIZE = 512
 GRAIN_SIZE = 512
+LIBRARY_ENV = "BRUSH_BRIDGE_PROCREATE_LIBRARY"
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+
+
+def library_dirs() -> list[Path]:
+    """Folders searched for user-supplied Procreate built-in images (existing ones only)."""
+    dirs = [Path(x) for x in os.environ.get(LIBRARY_ENV, "").split(os.pathsep) if x.strip()]
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    dirs.append(Path(local) / "BrushBridge" / "procreate_library")
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+    dirs.append(base / "procreate_library")
+    return [d for d in dirs if d.is_dir()]
+
+
+def default_library_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(local) / "BrushBridge" / "procreate_library"
+
+
+_INDEX_CACHE: dict[tuple, dict[str, Path]] = {}
+
+
+def _library_index() -> dict[str, Path]:
+    dirs = library_dirs()
+    key = tuple((str(d), d.stat().st_mtime_ns) for d in dirs)
+    if key in _INDEX_CACHE:
+        return _INDEX_CACHE[key]
+    index: dict[str, Path] = {}
+    for d in dirs:
+        try:
+            files = sorted(d.rglob("*"))
+        except OSError:
+            continue
+        for f in files:
+            if f.suffix.lower() in _IMAGE_EXTS and f.is_file():
+                index.setdefault(f.name.lower(), f)
+                index.setdefault(f.stem.lower(), f)
+    _INDEX_CACHE.clear()
+    _INDEX_CACHE[key] = index
+    return index
+
+
+def library_has(name: str) -> bool:
+    base = os.path.basename((name or "").replace("\\", "/")).strip().lower()
+    index = _library_index() if base else {}
+    return base in index or os.path.splitext(base)[0] in index
+
+
+def library_image(name: str) -> Optional[Image.Image]:
+    """The user's copy of a Procreate built-in image (``Brush-Preset-Ink.jpg``…), or None."""
+    base = os.path.basename((name or "").replace("\\", "/")).strip().lower()
+    if not base:
+        return None
+    index = _library_index()
+    path = index.get(base) or index.get(os.path.splitext(base)[0])
+    if path is None:
+        return None
+    try:
+        with Image.open(path) as im:
+            im.load()
+            return im.copy()
+    except OSError:
+        return None
 
 
 def _rng(name: str) -> np.random.Generator:
